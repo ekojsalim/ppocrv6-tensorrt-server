@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ppocrv6-tensorrt-server-tools"
+version = "0.1.0"
+description = "Utility scripts for PP-OCRv6 TensorRT server artifacts and checks."
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+  "huggingface_hub",
+  "numpy",
+  "onnx",
+  "pyyaml",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.setuptools]
+py-modules = []
