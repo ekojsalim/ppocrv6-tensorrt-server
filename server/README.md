@@ -44,6 +44,11 @@ podman run --rm --device nvidia.com/gpu=all --network host --entrypoint bash \
 The glyph and full-page OCR endpoints share the same recognizer artifacts.
 Full-page OCR is enabled only with `--enable-ocr`.
 
+Glyph images are aspect-fitted into the requested width by 48-pixel tensor.
+Normal near-square inputs retain their existing size; only width-overflow
+inputs scale down on both axes and receive white vertical padding. This avoids
+turning unusually wide single strokes into artificially thick bars.
+
 Glyph requests use `cjk_focus_fallback` by default, masking ASCII and visually
 confusable straight-line punctuation. When normal decoding is empty, it checks
 only `一` with a dedicated one-vs-blank classifier plus a long-horizontal-shape

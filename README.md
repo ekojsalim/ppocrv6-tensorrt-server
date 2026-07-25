@@ -36,6 +36,9 @@ native C++/CUDA/TensorRT runtime.
   skips the vocabulary-wide probability reduction on normal glyph chunks;
   requests that need calibrated model scores can select
   `"score_mode": "model"`.
+- Glyph preprocessing preserves aspect ratio on width overflow, containing
+  unusually wide inputs within the recognition tensor instead of squeezing
+  them into artificially thick shapes. Normal near-square glyphs are unchanged.
 - Public model preparation helpers for downloading PP-OCRv6 ONNX files,
   deriving the hidden recognizer, and exporting classifier weights.
 - Dependency-light generated examples and an end-to-end smoke test.

@@ -15,6 +15,7 @@ use axum::Router;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use clap::Parser;
+use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, RgbImage, RgbaImage};
 use native::{FullPageNativeConfig, NativeConfig, NativeFullPage, NativeRecognizer};
 use rayon::prelude::*;
@@ -1107,51 +1108,109 @@ fn write_preprocessed_image(
     width: usize,
     out: &mut [f32],
 ) -> Result<(), ApiError> {
-    let target_h = 48_u32;
-    let image_w = image.width();
-    let image_h = image.height();
-    let resized_w =
-        width.min((u64::from(target_h) * u64::from(image_w)).div_ceil(u64::from(image_h)) as usize);
-    let resized_w = resized_w.max(1);
+    let layout = glyph_resize_layout(image.width(), image.height(), width);
     let plane = 48 * width;
     if out.len() != 3 * plane {
         return Err(ApiError::internal("preprocess output slice has wrong size"));
     }
-    if image.width() == resized_w as u32 && image.height() == target_h {
-        write_rgb_tensor(image, width, resized_w, out);
+
+    if layout.resized_height < 48 {
+        fill_active_canvas_white(width, layout.resized_width, out);
+        let resized = image::imageops::resize(
+            image,
+            layout.resized_width as u32,
+            layout.resized_height as u32,
+            FilterType::Lanczos3,
+        );
+        write_rgb_tensor(&resized, width, layout, out);
         return Ok(());
     }
-    write_resized_rgb_tensor(image, width, resized_w, out);
+    if image.width() == layout.resized_width as u32
+        && image.height() == layout.resized_height as u32
+    {
+        write_rgb_tensor(image, width, layout, out);
+        return Ok(());
+    }
+    write_resized_rgb_tensor(image, width, layout, out);
     Ok(())
 }
 
-fn write_rgb_tensor(image: &RgbImage, width: usize, resized_w: usize, out: &mut [f32]) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GlyphResizeLayout {
+    resized_width: usize,
+    resized_height: usize,
+    y_offset: usize,
+}
+
+fn glyph_resize_layout(image_width: u32, image_height: u32, width: usize) -> GlyphResizeLayout {
+    debug_assert!(image_width > 0);
+    debug_assert!(image_height > 0);
+    debug_assert!(width > 0);
+
+    let image_width = u64::from(image_width);
+    let image_height = u64::from(image_height);
+    let target_height = 48_u64;
+    let target_width = width as u64;
+    let height_normalized_width = (target_height * image_width).div_ceil(image_height).max(1);
+
+    if height_normalized_width <= target_width {
+        return GlyphResizeLayout {
+            resized_width: height_normalized_width as usize,
+            resized_height: target_height as usize,
+            y_offset: 0,
+        };
+    }
+
+    let resized_height = ((target_width * image_height + image_width / 2) / image_width)
+        .clamp(1, target_height) as usize;
+    GlyphResizeLayout {
+        resized_width: width,
+        resized_height,
+        y_offset: (target_height as usize - resized_height) / 2,
+    }
+}
+
+fn fill_active_canvas_white(width: usize, resized_width: usize, out: &mut [f32]) {
     let plane = 48 * width;
-    for y in 0..48_usize {
-        for x in 0..resized_w {
+    for channel in 0..3 {
+        for y in 0..48_usize {
+            out[channel * plane + y * width..channel * plane + y * width + resized_width].fill(1.0);
+        }
+    }
+}
+
+fn write_rgb_tensor(image: &RgbImage, width: usize, layout: GlyphResizeLayout, out: &mut [f32]) {
+    let plane = 48 * width;
+    for y in 0..layout.resized_height {
+        for x in 0..layout.resized_width {
             let pixel = image.get_pixel(x as u32, y as u32);
             for channel in 0..3 {
-                out[channel * plane + y * width + x] =
+                out[channel * plane + (layout.y_offset + y) * width + x] =
                     (f32::from(pixel[channel]) / 255.0 - 0.5) / 0.5;
             }
         }
     }
 }
 
-fn write_resized_rgb_tensor(image: &RgbImage, width: usize, resized_w: usize, out: &mut [f32]) {
+fn write_resized_rgb_tensor(
+    image: &RgbImage,
+    width: usize,
+    layout: GlyphResizeLayout,
+    out: &mut [f32],
+) {
     let plane = 48 * width;
     let src_w = image.width() as usize;
     let src_h = image.height() as usize;
-    let scale_x = src_w as f32 / resized_w as f32;
-    let scale_y = src_h as f32 / 48.0;
+    let scale_x = src_w as f32 / layout.resized_width as f32;
+    let scale_y = src_h as f32 / layout.resized_height as f32;
 
-    for y in 0..48_usize {
+    for y in 0..layout.resized_height {
         let src_y = ((y as f32 + 0.5) * scale_y - 0.5).max(0.0);
         let y0 = (src_y.floor() as usize).min(src_h - 1);
         let y1 = (y0 + 1).min(src_h - 1);
         let wy = src_y - y0 as f32;
 
-        for x in 0..resized_w {
+        for x in 0..layout.resized_width {
             let src_x = ((x as f32 + 0.5) * scale_x - 0.5).max(0.0);
             let x0 = (src_x.floor() as usize).min(src_w - 1);
             let x1 = (x0 + 1).min(src_w - 1);
@@ -1166,7 +1225,7 @@ fn write_resized_rgb_tensor(image: &RgbImage, width: usize, resized_w: usize, ou
                 let top = f32::from(p00[channel]) * (1.0 - wx) + f32::from(p10[channel]) * wx;
                 let bottom = f32::from(p01[channel]) * (1.0 - wx) + f32::from(p11[channel]) * wx;
                 let value = top * (1.0 - wy) + bottom * wy;
-                out[channel * plane + y * width + x] = value / 127.5 - 1.0;
+                out[channel * plane + (layout.y_offset + y) * width + x] = value / 127.5 - 1.0;
             }
         }
     }
@@ -1324,8 +1383,12 @@ fn attach_ocr_rust_timings(
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use image::{Rgb, RgbImage};
 
-    use super::{Args, CharacterPolicy, ScoreMode};
+    use super::{
+        glyph_resize_layout, write_preprocessed_image, Args, CharacterPolicy, GlyphResizeLayout,
+        ScoreMode,
+    };
 
     #[test]
     fn defaults_to_cjk_focus_fallback_and_accepted_scores() {
@@ -1369,5 +1432,81 @@ mod tests {
         assert_eq!(ScoreMode::parse("accepted"), Some(ScoreMode::Accepted));
         assert_eq!(ScoreMode::parse("model"), Some(ScoreMode::Model));
         assert_eq!(ScoreMode::parse("probability"), None);
+    }
+
+    #[test]
+    fn glyph_resize_preserves_normal_widths_and_contains_overflow() {
+        assert_eq!(
+            glyph_resize_layout(48, 48, 80),
+            GlyphResizeLayout {
+                resized_width: 48,
+                resized_height: 48,
+                y_offset: 0,
+            }
+        );
+        assert_eq!(
+            glyph_resize_layout(53, 48, 80),
+            GlyphResizeLayout {
+                resized_width: 53,
+                resized_height: 48,
+                y_offset: 0,
+            }
+        );
+        assert_eq!(
+            glyph_resize_layout(191, 48, 80),
+            GlyphResizeLayout {
+                resized_width: 80,
+                resized_height: 20,
+                y_offset: 14,
+            }
+        );
+    }
+
+    #[test]
+    fn glyph_width_overflow_uses_white_vertical_padding() {
+        let image = RgbImage::from_pixel(191, 48, Rgb([0, 0, 0]));
+        let mut tensor = vec![0.0_f32; 3 * 48 * 80];
+        write_preprocessed_image(&image, 80, &mut tensor).unwrap();
+
+        let at = |channel: usize, y: usize, x: usize| tensor[channel * 48 * 80 + y * 80 + x];
+        for channel in 0..3 {
+            assert_eq!(at(channel, 0, 0), 1.0);
+            assert_eq!(at(channel, 13, 79), 1.0);
+            assert_eq!(at(channel, 14, 0), -1.0);
+            assert_eq!(at(channel, 33, 79), -1.0);
+            assert_eq!(at(channel, 34, 0), 1.0);
+            assert_eq!(at(channel, 47, 79), 1.0);
+        }
+    }
+
+    #[test]
+    fn glyph_normal_width_keeps_existing_right_padding() {
+        let image = RgbImage::from_pixel(53, 48, Rgb([0, 0, 0]));
+        let mut tensor = vec![0.0_f32; 3 * 48 * 80];
+        write_preprocessed_image(&image, 80, &mut tensor).unwrap();
+
+        let at = |channel: usize, y: usize, x: usize| tensor[channel * 48 * 80 + y * 80 + x];
+        for channel in 0..3 {
+            assert_eq!(at(channel, 0, 0), -1.0);
+            assert_eq!(at(channel, 47, 52), -1.0);
+            assert_eq!(at(channel, 0, 53), 0.0);
+            assert_eq!(at(channel, 47, 79), 0.0);
+        }
+    }
+
+    #[test]
+    fn glyph_width_overflow_preserves_a_one_pixel_stroke() {
+        let mut image = RgbImage::from_pixel(191, 48, Rgb([255, 255, 255]));
+        for x in 16..175 {
+            image.put_pixel(x, 24, Rgb([0, 0, 0]));
+        }
+        let mut tensor = vec![0.0_f32; 3 * 48 * 80];
+        write_preprocessed_image(&image, 80, &mut tensor).unwrap();
+
+        let darkest = tensor[..48 * 80].iter().copied().fold(1.0_f32, f32::min);
+        assert!(
+            darkest < 0.6,
+            "downsampling erased the one-pixel stroke: darkest={darkest}"
+        );
     }
 }

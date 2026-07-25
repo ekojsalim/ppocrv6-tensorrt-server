@@ -133,6 +133,12 @@ or:
 The defaults accept up to 1,024 images in one logical request and execute them
 in TensorRT chunks of up to 256 images.
 
+Glyph preprocessing preserves the source aspect ratio inside the requested
+`width` by 48-pixel recognition tensor. Inputs whose height-normalized width
+fits are unchanged (for example, 48x48 and 53x48 at the default width of 80).
+Wider inputs are scaled down on both axes and centered vertically with white
+padding instead of being squeezed horizontally.
+
 Glyph recognition defaults to `"character_policy": "cjk_focus_fallback"`.
 Its primary pass uses `cjk_focus`, masking ASCII classifier classes plus
 straight-line tokens visually confusable with CJK strokes: macron `¯`, en dash
