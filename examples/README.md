@@ -24,9 +24,10 @@ python3 examples/post_image.py \
 ```
 
 Glyph recognition uses `cjk_focus_fallback` by default, suppressing ASCII and
-straight-line punctuation confusable with CJK strokes and conservatively
-recovering strong CJK candidates from otherwise empty decodes. The generated
-fixture is the ASCII letter `A`, so this smoke example explicitly opts out.
+straight-line punctuation confusable with CJK strokes. Otherwise empty decodes
+can recover only `一`, using a dedicated one-vs-blank classifier plus a
+horizontal-shape gate. The generated fixture is the ASCII letter `A`, so this
+smoke example explicitly opts out.
 Glyphs also use accepted scores by default: a non-empty policy-approved result
 has `score: 1.0`. Add `--score-mode model` when inspecting the recognizer's
 actual probability.

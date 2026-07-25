@@ -111,6 +111,7 @@ endif()
 add_library(ppocrv6_native_core STATIC
   src/detection/db_postprocess.cpp
   src/recognition/ctc_decode.cpp
+  src/recognition/glyph_shape.cpp
 )
 target_include_directories(ppocrv6_native_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -160,6 +161,13 @@ add_executable(ppocrv6_ctc_smoke
   src/tools/ctc_smoke.cpp
 )
 target_link_libraries(ppocrv6_ctc_smoke PRIVATE
+  ppocrv6_native_core
+)
+
+add_executable(ppocrv6_glyph_shape_smoke
+  src/tools/glyph_shape_smoke.cpp
+)
+target_link_libraries(ppocrv6_glyph_shape_smoke PRIVATE
   ppocrv6_native_core
 )
 

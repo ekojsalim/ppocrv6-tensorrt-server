@@ -146,15 +146,23 @@ Set `"character_policy": "suppress_ascii"` for the narrower legacy policy or
 ASCII or the masked line symbols. Character policies are glyph-only; full-page
 OCR always uses the unrestricted vocabulary.
 
-When normal `cjk_focus` CTC decoding is empty, the default policy examines the
-strongest CJK-ideograph alternative without suppressing CTC blank globally.
-The candidate is applied only when its probability in the original
-distribution is at least `0.05` and its probability among CJK-only alternatives
-is at least `0.8`. Responses include `empty_fallback_attempted_count`,
-`empty_fallback_applied_count`, and per-prediction `empty_fallback`
-diagnostics. This policy costs an additional classifier pass only for chunks
-containing an empty decode. Set `"character_policy": "cjk_focus"` to disable
-only this empty-result fallback while retaining the same vocabulary masking.
+When normal `cjk_focus` CTC decoding is empty, the default policy checks only
+the common single-stroke character `一`; it does not search for or synthesize
+any other CJK character. A small CUDA classifier evaluates the existing
+PP-OCRv6 `一` classifier column against the already-known blank logit. The
+result is accepted only when that one-vs-blank probability is at least `0.005`
+and the already-preprocessed pixels form one long, thin, horizontally coherent
+stroke. The shape gate keeps blank, dot, vertical, diagonal, box, and multi-line
+controls out of the fallback.
+
+This path is substantially cheaper than a second full-vocabulary classifier
+pass. Responses include `empty_fallback_attempted_count`,
+`empty_fallback_applied_count`, `one_stroke_fallback_applied_count`, and
+per-prediction `empty_fallback` diagnostics. A recovery reports
+`empty_fallback.applied_by: "one_stroke"` and
+`score_type: "one_vs_blank_probability"`. Set
+`"character_policy": "cjk_focus"` to disable the `一` fallback while retaining
+the same vocabulary masking.
 
 Suppression does not rewrite punctuation into a guessed CJK character. It lets
 the classifier choose among blank and the remaining classes.
@@ -168,9 +176,9 @@ policy-approved glyphs.
 
 Accepted mode is also a classifier optimization: normal chunks skip the
 vocabulary-wide exponential/sum reduction and probability device-to-host copy.
-If a `cjk_focus_fallback` primary decode is empty, the server still calculates
-real probabilities internally for the fallback's minimum-score gates. Those
-values remain visible in the per-prediction `empty_fallback` diagnostics.
+If a `cjk_focus_fallback` primary decode is empty, the server calculates only
+the dedicated `一`-vs-blank probability used by the shape-gated fallback. That
+value remains visible in the per-prediction `empty_fallback` diagnostics.
 
 Set `"score_mode": "model"` when the caller needs model confidence. In that
 mode, `cjk_focus`, `suppress_ascii`, and the primary pass of

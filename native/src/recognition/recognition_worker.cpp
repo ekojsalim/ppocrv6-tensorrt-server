@@ -4,6 +4,7 @@
 #include "ppocrv6_native/common/cuda_ptr.h"
 #include "ppocrv6_native/engine/trt_engine.h"
 #include "ppocrv6_native/kernels/classifier.h"
+#include "ppocrv6_native/recognition/glyph_shape.h"
 
 #include <NvInfer.h>
 #include <cuda_fp16.h>
@@ -49,14 +50,8 @@ const char *score_mode_name(ScoreMode mode) noexcept {
 
 namespace {
 
-constexpr float kEmptyFallbackMinScore = 0.05f;
-constexpr float kEmptyFallbackMinCjkScore = 0.8f;
-
-bool should_apply_empty_fallback(float score, float cjk_score) noexcept {
-  return std::isfinite(score) && std::isfinite(cjk_score) &&
-         score >= kEmptyFallbackMinScore &&
-         cjk_score >= kEmptyFallbackMinCjkScore;
-}
+constexpr float kOneStrokeFallbackMinProbability = 0.005f;
+constexpr const char *kOneToken = "\xE4\xB8\x80";
 
 class Logger final : public nvinfer1::ILogger {
 public:
@@ -144,56 +139,6 @@ bool is_cjk_focus_extra_suppressed_token(const std::string &token) {
          token == "\xEF\xBC\x8D";   // FULLWIDTH HYPHEN-MINUS
 }
 
-bool decode_single_utf8_codepoint(const std::string &token,
-                                  std::uint32_t &codepoint) {
-  if (token.empty()) {
-    return false;
-  }
-  const auto *bytes =
-      reinterpret_cast<const unsigned char *>(token.data());
-  const std::size_t size = token.size();
-  std::size_t expected = 0;
-  std::uint32_t value = 0;
-  if (bytes[0] < 0x80) {
-    expected = 1;
-    value = bytes[0];
-  } else if ((bytes[0] & 0xe0U) == 0xc0U) {
-    expected = 2;
-    value = bytes[0] & 0x1fU;
-  } else if ((bytes[0] & 0xf0U) == 0xe0U) {
-    expected = 3;
-    value = bytes[0] & 0x0fU;
-  } else if ((bytes[0] & 0xf8U) == 0xf0U) {
-    expected = 4;
-    value = bytes[0] & 0x07U;
-  } else {
-    return false;
-  }
-  if (size != expected) {
-    return false;
-  }
-  for (std::size_t i = 1; i < expected; ++i) {
-    if ((bytes[i] & 0xc0U) != 0x80U) {
-      return false;
-    }
-    value = (value << 6U) | (bytes[i] & 0x3fU);
-  }
-  codepoint = value;
-  return true;
-}
-
-bool is_cjk_ideograph_token(const std::string &token) {
-  std::uint32_t codepoint = 0;
-  if (!decode_single_utf8_codepoint(token, codepoint)) {
-    return false;
-  }
-  return (codepoint >= 0x3400U && codepoint <= 0x4dbfU) ||
-         (codepoint >= 0x4e00U && codepoint <= 0x9fffU) ||
-         (codepoint >= 0xf900U && codepoint <= 0xfaffU) ||
-         (codepoint >= 0x20000U && codepoint <= 0x2fa1fU) ||
-         (codepoint >= 0x30000U && codepoint <= 0x323afU);
-}
-
 std::size_t volume(const nvinfer1::Dims &dims) {
   if (dims.nbDims <= 0) {
     return 0;
@@ -273,15 +218,10 @@ struct SharedResources {
     }
     auto host_ascii_suppressed_bias = host_bias;
     auto host_cjk_focus_bias = host_bias;
-    auto host_cjk_ideograph_nonblank_bias = host_bias;
     constexpr std::uint16_t kHalfNegativeInfinity = 0xfc00U;
     for (std::size_t class_id = 0; class_id < characters.size(); ++class_id) {
-      if (static_cast<int>(class_id) == config.blank_id ||
-          !is_cjk_ideograph_token(characters[class_id])) {
-        host_cjk_ideograph_nonblank_bias[class_id] =
-            kHalfNegativeInfinity;
-      } else {
-        ++cjk_ideograph_class_count;
+      if (characters[class_id] == kOneToken) {
+        one_class_id = static_cast<int>(class_id);
       }
       if (static_cast<int>(class_id) == config.blank_id) {
         continue;
@@ -297,12 +237,14 @@ struct SharedResources {
         ++cjk_focus_suppressed_class_count;
       }
     }
+    if (one_class_id < 0) {
+      throw std::runtime_error("characters file does not contain 一");
+    }
 
     weight.reset(weight_count);
     bias.reset(bias_count);
     ascii_suppressed_bias.reset(bias_count);
     cjk_focus_bias.reset(bias_count);
-    cjk_ideograph_nonblank_bias.reset(bias_count);
     PPOCRV6_CUDA_CHECK(cudaMemcpy(weight.get(), host_weight.data(),
                                   host_weight.size() * sizeof(std::uint16_t),
                                   cudaMemcpyHostToDevice));
@@ -317,11 +259,6 @@ struct SharedResources {
         cjk_focus_bias.get(), host_cjk_focus_bias.data(),
         host_cjk_focus_bias.size() * sizeof(std::uint16_t),
         cudaMemcpyHostToDevice));
-    PPOCRV6_CUDA_CHECK(cudaMemcpy(
-        cjk_ideograph_nonblank_bias.get(),
-        host_cjk_ideograph_nonblank_bias.data(),
-        host_cjk_ideograph_nonblank_bias.size() * sizeof(std::uint16_t),
-        cudaMemcpyHostToDevice));
   }
 
   Logger logger;
@@ -331,11 +268,10 @@ struct SharedResources {
   CudaPtr<std::uint16_t> bias;
   CudaPtr<std::uint16_t> ascii_suppressed_bias;
   CudaPtr<std::uint16_t> cjk_focus_bias;
-  CudaPtr<std::uint16_t> cjk_ideograph_nonblank_bias;
   std::size_t ascii_suppressed_class_count = 0;
   std::size_t cjk_focus_extra_suppressed_class_count = 0;
   std::size_t cjk_focus_suppressed_class_count = 0;
-  std::size_t cjk_ideograph_class_count = 0;
+  int one_class_id = -1;
   std::vector<std::string> characters;
   std::string input_name;
   std::string output_name;
@@ -650,8 +586,7 @@ public:
     out << ",\"supported_score_modes\":[\"accepted\",\"model\"]";
     out << ",\"accepted_score_type\":\"binary_acceptance\"";
     out << ",\"model_score_type\":\"probability_or_conditional_probability\"";
-    out << ",\"accepted_probability_calculation\":"
-           "\"skipped_unless_empty_fallback\"";
+    out << ",\"accepted_probability_calculation\":\"skipped\"";
     out << ",\"supported_character_policies\":[\"cjk_focus\","
            "\"cjk_focus_fallback\",\"suppress_ascii\",\"all\"]";
     out << ",\"ascii_suppressed_class_count\":"
@@ -660,11 +595,11 @@ public:
         << resources_->cjk_focus_extra_suppressed_class_count;
     out << ",\"cjk_focus_suppressed_class_count\":"
         << resources_->cjk_focus_suppressed_class_count;
-    out << ",\"cjk_ideograph_fallback_class_count\":"
-        << resources_->cjk_ideograph_class_count;
-    out << ",\"empty_fallback_min_score\":" << kEmptyFallbackMinScore;
-    out << ",\"empty_fallback_min_cjk_score\":"
-        << kEmptyFallbackMinCjkScore;
+    out << ",\"one_stroke_fallback_token\":\"" << kOneToken << '"';
+    out << ",\"one_stroke_fallback_class_id\":"
+        << resources_->one_class_id;
+    out << ",\"one_stroke_fallback_min_probability\":"
+        << kOneStrokeFallbackMinProbability;
     out << ",\"context_mode\":\"switch\"";
     out << ",\"profiles\":" << resources_->engine->getNbOptimizationProfiles();
     out << ",\"shared_engine_use_count\":" << resources_.use_count();
@@ -717,15 +652,13 @@ private:
     indices_.reset(static_cast<std::size_t>(max_rows_));
     prob_.reset(static_cast<std::size_t>(max_rows_));
     max_logits_.reset(static_cast<std::size_t>(max_rows_));
+    one_vs_blank_prob_.reset(static_cast<std::size_t>(max_rows_));
     partial_ids_.reset(workspace.partial_count);
     partial_max_.reset(workspace.partial_count);
     partial_sum_.reset(workspace.partial_count);
     host_indices_.reset(static_cast<std::size_t>(max_rows_));
     host_prob_.reset(static_cast<std::size_t>(max_rows_));
-    host_max_logits_.reset(static_cast<std::size_t>(max_rows_));
-    host_fallback_indices_.reset(static_cast<std::size_t>(max_rows_));
-    host_fallback_prob_.reset(static_cast<std::size_t>(max_rows_));
-    host_fallback_max_logits_.reset(static_cast<std::size_t>(max_rows_));
+    host_one_vs_blank_prob_.reset(static_cast<std::size_t>(max_rows_));
   }
 
   void warmup() {
@@ -869,12 +802,6 @@ private:
                                          rows * sizeof(float),
                                          cudaMemcpyDeviceToHost, stream_));
     }
-    if (calculate_probability &&
-        character_policy == CharacterPolicy::kCjkFocusFallback) {
-      PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(
-          host_max_logits_.get(), max_logits_.get(), rows * sizeof(float),
-          cudaMemcpyDeviceToHost, stream_));
-    }
     PPOCRV6_CUDA_CHECK(cudaStreamSynchronize(stream_));
     if (!calculate_probability) {
       std::fill_n(host_prob_.get(), rows, 1.0f);
@@ -883,8 +810,7 @@ private:
     append_decoded_predictions(chunk_count, width, return_timesteps, result,
                                std::span<const int>(host_indices_.get(), rows),
                                std::span<const float>(host_prob_.get(), rows),
-                               std::span<const float>(host_max_logits_.get(),
-                                                      rows),
+                               std::span<const float>(chunk_input, input_count),
                                character_policy, score_mode, stream_);
   }
 
@@ -907,12 +833,6 @@ private:
                                          rows * sizeof(float),
                                          cudaMemcpyDeviceToHost, stream));
     }
-    if (calculate_probability &&
-        character_policy == CharacterPolicy::kCjkFocusFallback) {
-      PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(
-          host_max_logits_.get(), max_logits_.get(), rows * sizeof(float),
-          cudaMemcpyDeviceToHost, stream));
-    }
     PPOCRV6_CUDA_CHECK(cudaStreamSynchronize(stream));
     if (!calculate_probability) {
       std::fill_n(host_prob_.get(), rows, 1.0f);
@@ -921,9 +841,8 @@ private:
     append_decoded_predictions(chunk_count, width, return_timesteps, result,
                                std::span<const int>(host_indices_.get(), rows),
                                std::span<const float>(host_prob_.get(), rows),
-                               std::span<const float>(host_max_logits_.get(),
-                                                      rows),
-                               character_policy, score_mode, stream);
+                               std::span<const float>{}, character_policy,
+                               score_mode, stream);
   }
 
   void append_decoded_predictions(int chunk_count, int width,
@@ -931,7 +850,7 @@ private:
                                   RecognitionBatchResult &result,
                                   std::span<const int> ids,
                                   std::span<const float> scores,
-                                  std::span<const float> max_logits,
+                                  std::span<const float> host_nchw,
                                   CharacterPolicy character_policy,
                                   ScoreMode score_mode,
                                   cudaStream_t stream) {
@@ -939,37 +858,24 @@ private:
         ids, scores, chunk_count, active_timesteps_, resources_->characters,
         config_.blank_id);
 
-    const bool try_empty_fallback =
+    const bool try_one_stroke_fallback =
         character_policy == CharacterPolicy::kCjkFocusFallback &&
+        !host_nchw.empty() &&
         std::any_of(decoded.begin(), decoded.end(),
                     [](const DecodedText &value) {
                       return value.text.empty();
                     });
-    if (try_empty_fallback) {
-      if (score_mode == ScoreMode::kAccepted) {
-        launch_classifier(classifier_bias_for_policy(character_policy), stream,
-                          true);
-        const std::size_t rows = static_cast<std::size_t>(active_rows_);
-        PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(
-            host_prob_.get(), prob_.get(), rows * sizeof(float),
-            cudaMemcpyDeviceToHost, stream));
-        PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(
-            host_max_logits_.get(), max_logits_.get(), rows * sizeof(float),
-            cudaMemcpyDeviceToHost, stream));
-        PPOCRV6_CUDA_CHECK(cudaStreamSynchronize(stream));
-      }
-      launch_classifier(reinterpret_cast<const half *>(
-                            resources_->cjk_ideograph_nonblank_bias.get()),
-                        stream, true);
+    if (try_one_stroke_fallback) {
+      kernels::cuda_selected_class_vs_max_probability(
+          reinterpret_cast<const half *>(hidden_.get()),
+          reinterpret_cast<const half *>(resources_->weight.get()),
+          reinterpret_cast<const half *>(resources_->bias.get()),
+          max_logits_.get(), one_vs_blank_prob_.get(), active_rows_,
+          config_.hidden_size, config_.vocab_size, resources_->one_class_id,
+          stream);
       const std::size_t rows = static_cast<std::size_t>(active_rows_);
       PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(
-          host_fallback_indices_.get(), indices_.get(), rows * sizeof(int),
-          cudaMemcpyDeviceToHost, stream));
-      PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(
-          host_fallback_prob_.get(), prob_.get(), rows * sizeof(float),
-          cudaMemcpyDeviceToHost, stream));
-      PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(
-          host_fallback_max_logits_.get(), max_logits_.get(),
+          host_one_vs_blank_prob_.get(), one_vs_blank_prob_.get(),
           rows * sizeof(float), cudaMemcpyDeviceToHost, stream));
       PPOCRV6_CUDA_CHECK(cudaStreamSynchronize(stream));
     }
@@ -983,51 +889,59 @@ private:
     for (int row = 0; row < chunk_count; ++row) {
       RecognitionPrediction prediction;
       prediction.decoded = std::move(decoded[static_cast<std::size_t>(row)]);
-      if (try_empty_fallback && prediction.decoded.text.empty()) {
+      if (try_one_stroke_fallback && prediction.decoded.text.empty()) {
         prediction.empty_fallback_attempted = true;
         ++result.empty_fallback_attempted_count;
         const std::size_t start =
             static_cast<std::size_t>(row) *
             static_cast<std::size_t>(active_timesteps_);
-        float best_score = -1.0f;
+        float best_probability = -1.0f;
         for (int timestep = 0; timestep < active_timesteps_; ++timestep) {
           const std::size_t index =
               start + static_cast<std::size_t>(timestep);
           if (ids[index] != config_.blank_id) {
             continue;
           }
-          const int candidate_id = host_fallback_indices_.get()[index];
-          if (candidate_id < 0 ||
-              candidate_id >=
-                  static_cast<int>(resources_->characters.size())) {
+          const float probability = host_one_vs_blank_prob_.get()[index];
+          if (!std::isfinite(probability) ||
+              probability <= best_probability) {
             continue;
           }
-          const float blank_score = scores[index];
-          const float blank_margin =
-              max_logits[index] - host_fallback_max_logits_.get()[index];
-          const float candidate_score =
-              blank_score * std::exp(-blank_margin);
-          if (!std::isfinite(candidate_score) ||
-              candidate_score <= best_score) {
-            continue;
-          }
-          best_score = candidate_score;
+          best_probability = probability;
           prediction.empty_fallback_timestep = timestep;
-          prediction.empty_fallback_class_id = candidate_id;
-          prediction.empty_fallback_text =
-              resources_->characters[static_cast<std::size_t>(candidate_id)];
-          prediction.empty_fallback_score = candidate_score;
-          prediction.empty_fallback_cjk_score =
-              host_fallback_prob_.get()[index];
-          prediction.empty_fallback_blank_score = blank_score;
-          prediction.empty_fallback_blank_margin = blank_margin;
+          prediction.empty_fallback_class_id = resources_->one_class_id;
+          prediction.empty_fallback_text = kOneToken;
+          prediction.empty_fallback_score = probability;
+          prediction.empty_fallback_blank_score = 1.0f - probability;
+          const float diagnostic_probability =
+              std::clamp(probability, 1.0e-12f, 1.0f - 1.0e-7f);
+          prediction.empty_fallback_blank_margin =
+              std::log((1.0f - diagnostic_probability) /
+                       diagnostic_probability);
         }
-        if (prediction.empty_fallback_class_id >= 0 &&
-            should_apply_empty_fallback(
-                prediction.empty_fallback_score,
-                prediction.empty_fallback_cjk_score)) {
+        const std::size_t image_stride =
+            3U * 48U * static_cast<std::size_t>(width);
+        const auto features = detect_long_horizontal_stroke(
+            host_nchw.subspan(static_cast<std::size_t>(row) * image_stride,
+                              image_stride),
+            48, width);
+        prediction.one_stroke_fallback_evaluated = true;
+        prediction.one_stroke_fallback_shape_matched = features.matched;
+        prediction.one_stroke_width_ratio = features.width_ratio;
+        prediction.one_stroke_aspect_ratio = features.aspect_ratio;
+        prediction.one_stroke_height_ratio = features.height_ratio;
+        prediction.one_stroke_ink_column_coverage =
+            features.ink_column_coverage;
+        const bool apply_one_stroke_fallback =
+            std::isfinite(prediction.empty_fallback_score) &&
+            prediction.empty_fallback_score >=
+                kOneStrokeFallbackMinProbability &&
+            features.matched;
+        if (apply_one_stroke_fallback) {
           prediction.empty_fallback_applied = true;
+          prediction.empty_fallback_applied_by = "one_stroke";
           ++result.empty_fallback_applied_count;
+          ++result.one_stroke_fallback_applied_count;
           prediction.decoded.text = prediction.empty_fallback_text;
           prediction.decoded.score = prediction.empty_fallback_score;
           prediction.decoded.class_ids = {
@@ -1072,15 +986,13 @@ private:
   CudaPtr<int> indices_;
   CudaPtr<float> prob_;
   CudaPtr<float> max_logits_;
+  CudaPtr<float> one_vs_blank_prob_;
   CudaPtr<int> partial_ids_;
   CudaPtr<float> partial_max_;
   CudaPtr<float> partial_sum_;
   CudaHostPtr<int> host_indices_;
   CudaHostPtr<float> host_prob_;
-  CudaHostPtr<float> host_max_logits_;
-  CudaHostPtr<int> host_fallback_indices_;
-  CudaHostPtr<float> host_fallback_prob_;
-  CudaHostPtr<float> host_fallback_max_logits_;
+  CudaHostPtr<float> host_one_vs_blank_prob_;
   cudaStream_t stream_ = nullptr;
   nvinfer1::Dims4 input_dims_{};
   nvinfer1::Dims output_dims_{};
@@ -1190,10 +1102,11 @@ std::string recognition_result_to_json(const RecognitionBatchResult &result,
       << result.empty_fallback_attempted_count;
   out << ",\"empty_fallback_applied_count\":"
       << result.empty_fallback_applied_count;
+  out << ",\"one_stroke_fallback_applied_count\":"
+      << result.one_stroke_fallback_applied_count;
   if (result.character_policy == CharacterPolicy::kCjkFocusFallback) {
-    out << ",\"empty_fallback_min_score\":" << kEmptyFallbackMinScore;
-    out << ",\"empty_fallback_min_cjk_score\":"
-        << kEmptyFallbackMinCjkScore;
+    out << ",\"one_stroke_fallback_min_probability\":"
+        << kOneStrokeFallbackMinProbability;
   }
 
   out << ",\"meta\":{";
@@ -1212,10 +1125,11 @@ std::string recognition_result_to_json(const RecognitionBatchResult &result,
       << result.empty_fallback_attempted_count;
   out << ",\"empty_fallback_applied_count\":"
       << result.empty_fallback_applied_count;
+  out << ",\"one_stroke_fallback_applied_count\":"
+      << result.one_stroke_fallback_applied_count;
   if (result.character_policy == CharacterPolicy::kCjkFocusFallback) {
-    out << ",\"empty_fallback_min_score\":" << kEmptyFallbackMinScore;
-    out << ",\"empty_fallback_min_cjk_score\":"
-        << kEmptyFallbackMinCjkScore;
+    out << ",\"one_stroke_fallback_min_probability\":"
+        << kOneStrokeFallbackMinProbability;
   }
   out << '}';
 
@@ -1238,18 +1152,38 @@ std::string recognition_result_to_json(const RecognitionBatchResult &result,
       out << ",\"empty_fallback\":{";
       out << "\"applied\":"
           << (prediction.empty_fallback_applied ? "true" : "false");
+      out << ",\"applied_by\":";
+      if (prediction.empty_fallback_applied_by.empty()) {
+        out << "null";
+      } else {
+        append_json_escaped(out, prediction.empty_fallback_applied_by);
+      }
       out << ",\"timestep\":" << prediction.empty_fallback_timestep;
       out << ",\"class_id\":" << prediction.empty_fallback_class_id;
       out << ",\"text\":";
       append_json_escaped(out, prediction.empty_fallback_text);
       out << ",\"score\":";
       append_float(out, prediction.empty_fallback_score);
-      out << ",\"cjk_score\":";
-      append_float(out, prediction.empty_fallback_cjk_score);
+      out << ",\"score_type\":\"one_vs_blank_probability\"";
       out << ",\"blank_score\":";
       append_float(out, prediction.empty_fallback_blank_score);
       out << ",\"blank_margin\":";
       append_float(out, prediction.empty_fallback_blank_margin);
+      if (prediction.one_stroke_fallback_evaluated) {
+        out << ",\"one_stroke\":{";
+        out << "\"shape_matched\":"
+            << (prediction.one_stroke_fallback_shape_matched ? "true"
+                                                            : "false");
+        out << ",\"width_ratio\":";
+        append_float(out, prediction.one_stroke_width_ratio);
+        out << ",\"aspect_ratio\":";
+        append_float(out, prediction.one_stroke_aspect_ratio);
+        out << ",\"height_ratio\":";
+        append_float(out, prediction.one_stroke_height_ratio);
+        out << ",\"ink_column_coverage\":";
+        append_float(out, prediction.one_stroke_ink_column_coverage);
+        out << '}';
+      }
       out << '}';
     }
     if (include_timesteps) {

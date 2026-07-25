@@ -48,13 +48,19 @@ struct RecognitionPrediction {
   std::vector<float> timestep_scores;
   bool empty_fallback_attempted = false;
   bool empty_fallback_applied = false;
+  std::string empty_fallback_applied_by;
   int empty_fallback_timestep = -1;
   int empty_fallback_class_id = -1;
   std::string empty_fallback_text;
   float empty_fallback_score = 0.0f;
-  float empty_fallback_cjk_score = 0.0f;
   float empty_fallback_blank_score = 0.0f;
   float empty_fallback_blank_margin = 0.0f;
+  bool one_stroke_fallback_evaluated = false;
+  bool one_stroke_fallback_shape_matched = false;
+  float one_stroke_width_ratio = 0.0f;
+  float one_stroke_aspect_ratio = 0.0f;
+  float one_stroke_height_ratio = 0.0f;
+  float one_stroke_ink_column_coverage = 0.0f;
 };
 
 struct RecognitionChunkMeta {
@@ -73,6 +79,7 @@ struct RecognitionBatchResult {
   std::size_t output_bytes = 0;
   int empty_fallback_attempted_count = 0;
   int empty_fallback_applied_count = 0;
+  int one_stroke_fallback_applied_count = 0;
   std::vector<RecognitionChunkMeta> chunks;
   std::vector<RecognitionPrediction> predictions;
 };

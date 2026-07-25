@@ -24,11 +24,13 @@ native C++/CUDA/TensorRT runtime.
   the final PP-OCRv6 classifier, so native code applies the FP16 classifier and
   emits decoded text without materializing the large `[N,T,18710]` logits
   tensor, reducing classifier-stage VRAM pressure.
-- Glyph requests use the CJK-focus policy with conservative empty-result
-  fallback by default, masking ASCII and straight-line punctuation confusable
-  with CJK strokes before argmax and CTC decode. Requests can select plain
-  `cjk_focus`, `suppress_ascii`, or opt out with `"character_policy": "all"`;
-  full-page OCR always uses the full vocabulary.
+- Glyph requests use CJK-focused decoding with a dedicated `一`-only
+  empty-result fallback by default. ASCII and confusable straight-line
+  punctuation are masked before argmax/CTC decode; a blank result is recovered
+  only when a lightweight `一`-vs-blank classifier and a long/thin/horizontal
+  shape test both pass. Requests can select plain `cjk_focus`,
+  `suppress_ascii`, or opt out with `"character_policy": "all"`; full-page OCR
+  always uses the full vocabulary.
 - Accepted glyphs return a binary `1.0` score by default so client-side
   probability thresholds do not discard policy-approved results. This also
   skips the vocabulary-wide probability reduction on normal glyph chunks;

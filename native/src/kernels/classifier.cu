@@ -16,6 +16,7 @@ constexpr int kMaxRowsPerBlock = 8;
 constexpr int kWmmaRowsPerBlock = 16;
 constexpr int kWmmaTile = 16;
 constexpr int kWarpSize = 32;
+constexpr int kSelectedClassThreads = 256;
 
 int ceil_div(int value, int divisor) {
   return (value + divisor - 1) / divisor;
@@ -104,6 +105,40 @@ __global__ void linear_argmax_prob_kernel(
     out_indices[row] = shared_id[0];
     out_max_logits[row] = row_max;
     out_prob[row] = 1.0f / shared_sum[0];
+  }
+}
+
+__global__ void selected_class_vs_max_probability_kernel(
+    const half *__restrict__ hidden, const half *__restrict__ weight,
+    const half *__restrict__ bias, const float *__restrict__ max_logits,
+    float *__restrict__ out_probability, int rows, int hidden_size,
+    int vocab_size, int class_id) {
+  __shared__ float partial[kSelectedClassThreads];
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (row >= rows) {
+    return;
+  }
+
+  float value = tid == 0 ? __half2float(bias[class_id]) : 0.0f;
+  for (int h = tid; h < hidden_size; h += blockDim.x) {
+    value += __half2float(hidden[row * hidden_size + h]) *
+             __half2float(weight[h * vocab_size + class_id]);
+  }
+  partial[tid] = value;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      partial[tid] += partial[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    const float delta = partial[0] - max_logits[row];
+    const float ratio = __expf(fminf(delta, 0.0f));
+    out_probability[row] = ratio / (1.0f + ratio);
   }
 }
 
@@ -620,6 +655,27 @@ void cuda_linear_argmax_prob_wmma_mode(
       partial_ids, partial_max, partial_sum, out_indices, out_prob,
       out_max_logits, rows, kWmmaRowsPerBlock, workspace.num_vocab_blocks,
       calculate_probability);
+  PPOCRV6_CUDA_CHECK(cudaGetLastError());
+}
+
+void cuda_selected_class_vs_max_probability(
+    const half *hidden, const half *weight, const half *bias,
+    const float *max_logits, float *out_probability, int rows,
+    int hidden_size, int vocab_size, int class_id, cudaStream_t stream) {
+  if (rows <= 0) {
+    return;
+  }
+  if (hidden == nullptr || weight == nullptr || bias == nullptr ||
+      max_logits == nullptr || out_probability == nullptr ||
+      hidden_size <= 0 || vocab_size <= 0 || class_id < 0 ||
+      class_id >= vocab_size) {
+    throw std::invalid_argument(
+        "invalid selected-class classifier launch arguments");
+  }
+  selected_class_vs_max_probability_kernel<<<rows, kSelectedClassThreads, 0,
+                                             stream>>>(
+      hidden, weight, bias, max_logits, out_probability, rows, hidden_size,
+      vocab_size, class_id);
   PPOCRV6_CUDA_CHECK(cudaGetLastError());
 }
 
