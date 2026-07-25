@@ -149,7 +149,11 @@ def check_glyph(args: argparse.Namespace, glyph_path: Path) -> None:
         args.base_url,
         "/v1/glyphs/recognize",
         args.timeout,
-        {"image": image_payload(glyph_path), "width": args.glyph_width},
+        {
+            "image": image_payload(glyph_path),
+            "width": args.glyph_width,
+            "character_policy": "all",
+        },
     )
     write_json(args.json_out, "glyph-response.json", result)
     prediction = result.get("prediction")
@@ -158,6 +162,10 @@ def check_glyph(args: argparse.Namespace, glyph_path: Path) -> None:
         prediction = predictions[0] if predictions else {}
     text = prediction.get("text")
     prediction_score = score(prediction.get("score"))
+    expect(
+        result.get("character_policy") == "all",
+        "glyph smoke test did not opt out of ASCII suppression",
+    )
     expect(text == "A", f"glyph fixture decoded as {text!r}, expected 'A'")
     expect(
         prediction_score >= args.glyph_min_score,

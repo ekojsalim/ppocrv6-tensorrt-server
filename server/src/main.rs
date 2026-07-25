@@ -61,6 +61,13 @@ struct Args {
     )]
     characters: String,
 
+    #[arg(
+        long,
+        env = "PPOCRV6_GLYPH_CHARACTER_POLICY",
+        default_value = "cjk_focus_fallback"
+    )]
+    glyph_character_policy: String,
+
     #[arg(long, env = "PPOCRV6_GLYPH_HOST", default_value = "127.0.0.1")]
     host: String,
 
@@ -70,7 +77,7 @@ struct Args {
     #[arg(long, env = "PPOCRV6_GLYPH_WIDTH", default_value_t = 80)]
     width: i32,
 
-    #[arg(long, env = "PPOCRV6_GLYPH_BATCH_SIZE", default_value_t = 64)]
+    #[arg(long, env = "PPOCRV6_GLYPH_BATCH_SIZE", default_value_t = 256)]
     batch_size: i32,
 
     #[arg(long, env = "PPOCRV6_GLYPH_MAX_WIDTH", default_value_t = 128)]
@@ -79,7 +86,7 @@ struct Args {
     #[arg(long, env = "PPOCRV6_GLYPH_MAX_BATCH_SIZE", default_value_t = 256)]
     max_batch_size: i32,
 
-    #[arg(long, env = "PPOCRV6_GLYPH_MAX_IMAGES", default_value_t = 256)]
+    #[arg(long, env = "PPOCRV6_GLYPH_MAX_IMAGES", default_value_t = 1024)]
     max_images: usize,
 
     #[arg(long, env = "PPOCRV6_GLYPH_MAX_REQUEST_BYTES", default_value_t = 16 * 1024 * 1024)]
@@ -162,7 +169,7 @@ struct Args {
     #[arg(
         long,
         env = "PPOCRV6_OCR_REC_BUCKETS",
-        default_value = "640,1280,1600,2400,3200"
+        default_value = "128,256,384,512,640,960,1280,1600,2400,3200"
     )]
     ocr_rec_buckets: String,
 
@@ -226,6 +233,7 @@ struct Limits {
 struct Defaults {
     width: i32,
     batch_size: i32,
+    character_policy: CharacterPolicy,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -244,6 +252,7 @@ struct RecognizeRequest {
     width: Option<i32>,
     batch_size: Option<i32>,
     return_timesteps: Option<bool>,
+    character_policy: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,6 +264,36 @@ struct OcrRecognizeRequest {
 struct ApiError {
     status: StatusCode,
     message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+enum CharacterPolicy {
+    All = 0,
+    SuppressAscii = 1,
+    CjkFocus = 2,
+    CjkFocusFallback = 3,
+}
+
+impl CharacterPolicy {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "all" => Some(Self::All),
+            "suppress_ascii" | "suppress-ascii" => Some(Self::SuppressAscii),
+            "cjk_focus" | "cjk-focus" => Some(Self::CjkFocus),
+            "cjk_focus_fallback" | "cjk-focus-fallback" => Some(Self::CjkFocusFallback),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::SuppressAscii => "suppress_ascii",
+            Self::CjkFocus => "cjk_focus",
+            Self::CjkFocusFallback => "cjk_focus_fallback",
+        }
+    }
 }
 
 impl ApiError {
@@ -301,6 +340,8 @@ impl IntoResponse for ApiError {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
+    let default_character_policy = CharacterPolicy::parse(&args.glyph_character_policy)
+        .expect("glyph character policy was validated");
 
     let native_config = NativeConfig {
         engine_path: &args.engine,
@@ -382,6 +423,7 @@ async fn main() -> anyhow::Result<()> {
         defaults: Defaults {
             width: args.width,
             batch_size: args.batch_size,
+            character_policy: default_character_policy,
         },
         queue_timeout: Duration::from_millis(args.queue_timeout_ms),
     };
@@ -416,8 +458,39 @@ async fn main() -> anyhow::Result<()> {
         "{{\"event\":\"startup\",\"listening\":\"http://{}\",\"glyph_recognize\":\"http://{}/v1/glyphs/recognize\",\"ocr_enabled\":{},\"ocr_recognize\":\"http://{}/v1/ocr/recognize\"}}",
         addr, addr, args.enable_ocr, addr
     );
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            eprintln!("failed to install Ctrl-C shutdown handler: {err}");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                eprintln!("failed to install SIGTERM shutdown handler: {err}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 fn validate_args(args: &Args) -> anyhow::Result<()> {
@@ -432,6 +505,11 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
     }
     if args.worker_permits == 0 {
         anyhow::bail!("--worker-permits must be positive");
+    }
+    if CharacterPolicy::parse(&args.glyph_character_policy).is_none() {
+        anyhow::bail!(
+            "--glyph-character-policy must be one of cjk_focus, cjk_focus_fallback, suppress_ascii, all"
+        );
     }
     validate_limit_type_config(&args.ocr_det_limit_type)?;
     if args.ocr_det_default_height <= 0
@@ -495,6 +573,30 @@ async fn info(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
         .map_err(|err| ApiError::internal(err.to_string()))?;
     if let Value::Object(map) = &mut info {
         map.insert("limits".to_string(), json!(state.limits));
+        map.insert(
+            "default_character_policy".to_string(),
+            json!(state.defaults.character_policy.as_str()),
+        );
+        map.insert(
+            "score_type".to_string(),
+            json!(match state.defaults.character_policy {
+                CharacterPolicy::All => "probability",
+                CharacterPolicy::SuppressAscii
+                | CharacterPolicy::CjkFocus
+                | CharacterPolicy::CjkFocusFallback => {
+                    "conditional_probability"
+                }
+            }),
+        );
+        map.insert(
+            "score_types_by_character_policy".to_string(),
+            json!({
+                "cjk_focus": "conditional_probability",
+                "cjk_focus_fallback": "conditional_probability",
+                "suppress_ascii": "conditional_probability",
+                "all": "probability",
+            }),
+        );
     }
     Ok(Json(info))
 }
@@ -565,6 +667,14 @@ async fn ocr_recognize(
 
 fn recognize_blocking(state: AppState, payload: RecognizeRequest) -> Result<Value, ApiError> {
     let request_started = Instant::now();
+    let character_policy = match payload.character_policy.as_deref() {
+        Some(value) => CharacterPolicy::parse(value).ok_or_else(|| {
+            ApiError::bad_request(
+                "'character_policy' must be one of 'cjk_focus', 'cjk_focus_fallback', 'suppress_ascii', or 'all'",
+            )
+        })?,
+        None => state.defaults.character_policy,
+    };
     let single_image_request = payload.image.is_some() && payload.images.is_none();
     let image_values = extract_images(payload.image, payload.images, state.limits.max_images)?;
     let width = optional_int(
@@ -602,6 +712,7 @@ fn recognize_blocking(state: AppState, payload: RecognizeRequest) -> Result<Valu
             width,
             batch_size,
             return_timesteps,
+            character_policy as i32,
         )
         .map_err(|err| ApiError::internal(err.to_string()))?;
     let blocking_ms = request_started.elapsed().as_secs_f64() * 1000.0;
@@ -946,10 +1057,8 @@ fn write_preprocessed_image(
     let target_h = 48_u32;
     let image_w = image.width();
     let image_h = image.height();
-    let resized_w = width.min(
-        ((u64::from(target_h) * u64::from(image_w) + u64::from(image_h) - 1) / u64::from(image_h))
-            as usize,
-    );
+    let resized_w =
+        width.min((u64::from(target_h) * u64::from(image_w)).div_ceil(u64::from(image_h)) as usize);
     let resized_w = resized_w.max(1);
     let plane = 48 * width;
     if out.len() != 3 * plane {
@@ -1156,5 +1265,48 @@ fn attach_ocr_rust_timings(
             );
             native_timing.insert("rust_blocking_ms".to_string(), json!(blocking_ms));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Args, CharacterPolicy};
+
+    #[test]
+    fn defaults_to_cjk_focus_fallback() {
+        let args = Args::try_parse_from(["ppocrv6-tensorrt-server"]).unwrap();
+        assert_eq!(args.glyph_character_policy, "cjk_focus_fallback");
+    }
+
+    #[test]
+    fn parses_character_policies() {
+        assert_eq!(
+            CharacterPolicy::parse("cjk_focus"),
+            Some(CharacterPolicy::CjkFocus)
+        );
+        assert_eq!(
+            CharacterPolicy::parse("cjk-focus"),
+            Some(CharacterPolicy::CjkFocus)
+        );
+        assert_eq!(
+            CharacterPolicy::parse("cjk_focus_fallback"),
+            Some(CharacterPolicy::CjkFocusFallback)
+        );
+        assert_eq!(
+            CharacterPolicy::parse("cjk-focus-fallback"),
+            Some(CharacterPolicy::CjkFocusFallback)
+        );
+        assert_eq!(
+            CharacterPolicy::parse("suppress_ascii"),
+            Some(CharacterPolicy::SuppressAscii)
+        );
+        assert_eq!(
+            CharacterPolicy::parse("suppress-ascii"),
+            Some(CharacterPolicy::SuppressAscii)
+        );
+        assert_eq!(CharacterPolicy::parse("all"), Some(CharacterPolicy::All));
+        assert_eq!(CharacterPolicy::parse("cjk"), None);
     }
 }

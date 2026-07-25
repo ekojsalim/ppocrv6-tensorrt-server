@@ -18,6 +18,9 @@ data/
 artifacts/*
 !artifacts/README.md
 
+# Backup-worker bootstrap and publishing files are maintained externally.
+deploy/
+
 *.a
 *.so
 *.dylib

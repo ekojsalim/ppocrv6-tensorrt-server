@@ -12,18 +12,28 @@ native C++/CUDA/TensorRT runtime.
   no CUDA streams, TensorRT contexts, or device pointers exposed to Rust.
 - TensorRT DB detector and TensorRT hidden recognizer workers with long-lived
   engine/context state.
-- Multi-profile recognizer engine for both cropped glyph batches and full-line
-  OCR crops.
+- One shared recognizer engine/classifier allocation with independent execution
+  contexts for glyph traffic and full-page OCR.
+- Recognition profiles tuned for glyphs and OCR lines, with an optional
+  short-line profile in newly built engines. The runtime filters line buckets
+  against the loaded engine and allocates context workspace lazily for the
+  smallest compatible profile.
+- CUDA detector resize/color conversion/normalization.
 - CUDA ROI warp and recognition preprocessing for detected text boxes.
 - Custom CUDA classifier and native CTC decode. The recognizer is cut before
   the final PP-OCRv6 classifier, so native code applies the FP16 classifier and
   emits decoded text without materializing the large `[N,T,18710]` logits
   tensor, reducing classifier-stage VRAM pressure.
+- Glyph requests use the CJK-focus policy with conservative empty-result
+  fallback by default, masking ASCII and straight-line punctuation confusable
+  with CJK strokes before argmax and CTC decode. Requests can select plain
+  `cjk_focus`, `suppress_ascii`, or opt out with `"character_policy": "all"`;
+  full-page OCR always uses the full vocabulary.
 - Public model preparation helpers for downloading PP-OCRv6 ONNX files,
   deriving the hidden recognizer, and exporting classifier weights.
 - Dependency-light generated examples and an end-to-end smoke test.
-- TensorRT/CUDA/OpenCV/Clipper container build recipe for reproducible local
-  builds.
+- Standalone TensorRT and vLLM-compatible CUDA 13 / TensorRT 10.14 container
+  build recipes.
 
 The production path is:
 
@@ -32,7 +42,7 @@ Rust HTTP server
   -> base64/image decode, request limits, admission, queue timeout
   -> coarse C ABI call
   -> C++/CUDA/TensorRT full-page worker
-       -> OpenCV detector preprocessing
+       -> one RGB upload + CUDA detector preprocessing
        -> TensorRT DB detector
        -> OpenCV/Clipper DB postprocess
        -> CUDA ROI warp + recognition preprocessing
@@ -79,7 +89,21 @@ examples/             generated sample images and request helpers
 For a complete end-to-end validation checklist, use
 [docs/smoke-test.md](docs/smoke-test.md).
 
-Build the helper image:
+For the local `serve-orchestrator` deployment, build the OCR image on the same
+`vllm-openai:v0.23.0` CUDA 13 lineage:
+
+```bash
+podman build \
+  -f docker/vllm-ocr.Containerfile \
+  -t localhost/ppocrv6-vllm-ocr:dev \
+  .
+```
+
+This compiles and installs both the Rust server and native CUDA/TensorRT
+library. Its engines must also be built with TensorRT 10.14; the orchestrator
+mounts the compatible bundle from `tmp/vllm-ocr-model`.
+
+For standalone development on the newer NGC TensorRT image, build:
 
 ```bash
 podman build \

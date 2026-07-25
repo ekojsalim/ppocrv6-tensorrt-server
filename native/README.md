@@ -5,8 +5,9 @@ Rust server.
 
 Native responsibilities:
 
-- TensorRT engine and execution-context lifetime.
-- OpenCV detector resize/normalize preprocessing.
+- Shared TensorRT recognizer engine/classifier lifetime with per-worker
+  execution contexts and profile-sized workspace.
+- CUDA detector resize/color conversion/normalize preprocessing.
 - TensorRT DB detector execution.
 - OpenCV/Clipper DB postprocess.
 - CUDA ROI warp and recognition preprocessing.

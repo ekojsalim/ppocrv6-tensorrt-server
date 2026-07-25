@@ -72,6 +72,26 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 if(PPOCRV6_NATIVE_ENABLE_OPENCV_POSTPROCESS)
   find_package(OpenCV QUIET COMPONENTS core imgproc)
+  if(NOT OpenCV_FOUND)
+    find_path(OPENCV_INCLUDE_DIR
+      NAMES opencv2/core.hpp
+      HINTS /usr/include/opencv4 /usr/local/include/opencv4
+    )
+    find_library(OPENCV_CORE_LIBRARY
+      NAMES opencv_core
+      HINTS /usr/lib /usr/local/lib /usr/lib/x86_64-linux-gnu
+    )
+    find_library(OPENCV_IMGPROC_LIBRARY
+      NAMES opencv_imgproc
+      HINTS /usr/lib /usr/local/lib /usr/lib/x86_64-linux-gnu
+    )
+    if(OPENCV_INCLUDE_DIR AND OPENCV_CORE_LIBRARY AND OPENCV_IMGPROC_LIBRARY)
+      set(OpenCV_FOUND ON)
+      set(OpenCV_INCLUDE_DIRS "${OPENCV_INCLUDE_DIR}")
+      set(OpenCV_LIBS "${OPENCV_CORE_LIBRARY}" "${OPENCV_IMGPROC_LIBRARY}")
+      set(OpenCV_VERSION "manual")
+    endif()
+  endif()
   find_path(POLYCLIPPING_INCLUDE_DIR
     NAMES polyclipping/clipper.hpp clipper.hpp
     HINTS /usr/include /usr/local/include
@@ -114,6 +134,7 @@ if(PPOCRV6_NATIVE_HAVE_OPENCV_POSTPROCESS)
 endif()
 
 add_library(ppocrv6_native_cuda STATIC
+  src/kernels/detector_preprocess.cu
   src/kernels/roi_warp.cu
   src/kernels/classifier.cu
 )

@@ -83,6 +83,8 @@ podman run --rm --device nvidia.com/gpu=all --network host --entrypoint bash \
          --workspace-mib 1024 \
          --glyph-min-batch 1 --glyph-opt-batch 128 --glyph-max-batch 256 \
          --glyph-min-width 48 --glyph-opt-width 80 --glyph-max-width 128 \
+         --short-line-min-batch 1 --short-line-opt-batch 8 --short-line-max-batch 12 \
+         --short-line-min-width 128 --short-line-opt-width 384 --short-line-max-width 640 \
          --line-min-batch 1 --line-opt-batch 8 --line-max-batch 12 \
          --line-min-width 640 --line-opt-width 1600 --line-max-width 3200'
 ```
@@ -147,13 +149,21 @@ python3 examples/e2e_smoke.py \
 
 For ad hoc single-image requests, see [../examples/README.md](../examples/README.md).
 
-For throughput checks:
+For throughput checks, use PNG or JPEG inputs representative of production.
+The generated PPM files are deterministic smoke fixtures; their much larger
+base64/JSON bodies do not represent production transport or memory behavior.
+The default server accepts up to 1,024 images per logical request and executes
+them in TensorRT chunks of up to the engine's 256-image profile maximum.
 
 ```bash
+magick examples/samples/glyph_A.ppm /tmp/glyph_A.png
+
 python3 tools/bench_glyph_http.py \
   --url http://127.0.0.1:8184/v1/glyphs/recognize \
-  --image examples/samples/glyph_A.ppm \
+  --image /tmp/glyph_A.png \
+  --unique-image-payloads \
   --counts 1,6,16,32,64 \
   --width 80 \
-  --batch-size 64
+  --batch-size 256 \
+  --character-policy all
 ```

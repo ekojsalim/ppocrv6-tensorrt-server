@@ -20,6 +20,18 @@ int ppocrv6_recognizer_recognize_f32(ppocrv6_recognizer *handle,
                                      int batch_size, int return_timesteps,
                                      char **out_json, char **out_error);
 
+enum {
+  PPOCRV6_CHARACTER_POLICY_ALL = 0,
+  PPOCRV6_CHARACTER_POLICY_SUPPRESS_ASCII = 1,
+  PPOCRV6_CHARACTER_POLICY_CJK_FOCUS = 2,
+  PPOCRV6_CHARACTER_POLICY_CJK_FOCUS_FALLBACK = 3,
+};
+
+int ppocrv6_recognizer_recognize_f32_with_options(
+    ppocrv6_recognizer *handle, const float *nchw, int count, int width,
+    int batch_size, int return_timesteps, int character_policy,
+    char **out_json, char **out_error);
+
 void ppocrv6_recognizer_free_string(char *value);
 
 #ifdef __cplusplus

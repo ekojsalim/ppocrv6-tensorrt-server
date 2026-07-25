@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <fstream>
 #include <iomanip>
@@ -169,7 +170,6 @@ double elapsed_ms(std::chrono::steady_clock::time_point start,
 }
 
 float elapsed_event_ms(cudaEvent_t start, cudaEvent_t stop) {
-  PPOCRV6_CUDA_CHECK(cudaEventSynchronize(stop));
   float elapsed = 0.0f;
   PPOCRV6_CUDA_CHECK(cudaEventElapsedTime(&elapsed, start, stop));
   return elapsed;
@@ -277,7 +277,11 @@ public:
           context_memory_.get(), static_cast<int64_t>(context_memory_bytes_));
     }
 
-    PPOCRV6_CUDA_CHECK(cudaStreamCreate(&stream_));
+    PPOCRV6_CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+    PPOCRV6_CUDA_CHECK(cudaEventCreate(&event_start_));
+    PPOCRV6_CUDA_CHECK(cudaEventCreate(&event_after_input_));
+    PPOCRV6_CUDA_CHECK(cudaEventCreate(&event_after_execute_));
+    PPOCRV6_CUDA_CHECK(cudaEventCreate(&event_after_output_));
     allocate_for_max_shape();
     warmup();
   }
@@ -287,6 +291,18 @@ public:
       cudaStreamSynchronize(stream_);
       cudaStreamDestroy(stream_);
       stream_ = nullptr;
+    }
+    if (event_start_ != nullptr) {
+      cudaEventDestroy(event_start_);
+    }
+    if (event_after_input_ != nullptr) {
+      cudaEventDestroy(event_after_input_);
+    }
+    if (event_after_execute_ != nullptr) {
+      cudaEventDestroy(event_after_execute_);
+    }
+    if (event_after_output_ != nullptr) {
+      cudaEventDestroy(event_after_output_);
     }
   }
 
@@ -307,20 +323,31 @@ public:
     result.height = height;
     result.width = width;
 
-    cudaEvent_t event_start = nullptr;
-    cudaEvent_t event_stop = nullptr;
-    PPOCRV6_CUDA_CHECK(cudaEventCreate(&event_start));
-    PPOCRV6_CUDA_CHECK(cudaEventCreate(&event_stop));
-    try {
-      run_once(nchw, batch, height, width, copy_output, result, event_start,
-               event_stop);
-    } catch (...) {
-      cudaEventDestroy(event_start);
-      cudaEventDestroy(event_stop);
-      throw;
+    run_once(nchw, false, batch, height, width, copy_output, nullptr, result);
+    result.elapsed_ms = elapsed_ms(started, std::chrono::steady_clock::now());
+    return result;
+  }
+
+  DetectionTensorResult detect_device_f32(const float *device_nchw, int batch,
+                                          int height, int width,
+                                          bool copy_output,
+                                          cudaEvent_t input_ready) {
+    if (device_nchw == nullptr) {
+      throw std::runtime_error("device input tensor pointer is null");
     }
-    PPOCRV6_CUDA_CHECK(cudaEventDestroy(event_start));
-    PPOCRV6_CUDA_CHECK(cudaEventDestroy(event_stop));
+    if (batch <= 0 || batch > config_.max_batch || height <= 0 ||
+        height > config_.max_height || width <= 0 || width > config_.max_width) {
+      throw std::runtime_error("detector input shape is outside worker limits");
+    }
+
+    std::lock_guard<std::mutex> guard(mutex_);
+    const auto started = std::chrono::steady_clock::now();
+    DetectionTensorResult result;
+    result.batch = batch;
+    result.height = height;
+    result.width = width;
+    run_once(device_nchw, true, batch, height, width, copy_output, input_ready,
+             result);
     result.elapsed_ms = elapsed_ms(started, std::chrono::steady_clock::now());
     return result;
   }
@@ -366,6 +393,7 @@ private:
                         static_cast<std::size_t>(config_.max_width);
     device_input_.reset(max_input_count_);
     device_output_.reset(max_output_count_);
+    host_output_.reset(max_output_count_);
   }
 
   void warmup() {
@@ -383,9 +411,9 @@ private:
     }
   }
 
-  void run_once(const float *nchw, int batch, int height, int width,
-                bool copy_output, DetectionTensorResult &result,
-                cudaEvent_t event_start, cudaEvent_t event_stop) {
+  void run_once(const float *nchw, bool input_is_device, int batch, int height,
+                int width, bool copy_output, cudaEvent_t input_ready,
+                DetectionTensorResult &result) {
     const std::size_t input_count = static_cast<std::size_t>(batch) * 3U *
                                     static_cast<std::size_t>(height) *
                                     static_cast<std::size_t>(width);
@@ -420,37 +448,52 @@ private:
     result.output_w = output_dims.nbDims > 3 ? output_dims.d[3] : 0;
     result.output_bytes = output_count * dtype_size(output_dtype_);
 
-    PPOCRV6_CUDA_CHECK(cudaEventRecord(event_start, stream_));
-    PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(device_input_.get(), nchw,
-                                       input_count * sizeof(float),
-                                       cudaMemcpyHostToDevice, stream_));
-    PPOCRV6_CUDA_CHECK(cudaEventRecord(event_stop, stream_));
-    result.h2d_ms = elapsed_event_ms(event_start, event_stop);
+    if (input_ready != nullptr) {
+      PPOCRV6_CUDA_CHECK(cudaStreamWaitEvent(stream_, input_ready, 0));
+    }
+    PPOCRV6_CUDA_CHECK(cudaEventRecord(event_start_, stream_));
+    const float *device_input = nchw;
+    if (!input_is_device) {
+      PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(
+          device_input_.get(), nchw, input_count * sizeof(float),
+          cudaMemcpyHostToDevice, stream_));
+      device_input = device_input_.get();
+    }
+    PPOCRV6_CUDA_CHECK(cudaEventRecord(event_after_input_, stream_));
 
-    if (!context_->setTensorAddress(input_name_.c_str(), device_input_.get()) ||
+    if (!context_->setTensorAddress(input_name_.c_str(),
+                                    const_cast<float *>(device_input)) ||
         !context_->setTensorAddress(output_name_.c_str(), device_output_.get())) {
       throw std::runtime_error("failed to set detector tensor addresses");
     }
 
-    PPOCRV6_CUDA_CHECK(cudaEventRecord(event_start, stream_));
     if (!context_->enqueueV3(stream_)) {
       throw std::runtime_error("TensorRT detector enqueue failed");
     }
-    PPOCRV6_CUDA_CHECK(cudaEventRecord(event_stop, stream_));
-    result.execute_ms = elapsed_event_ms(event_start, event_stop);
+    PPOCRV6_CUDA_CHECK(cudaEventRecord(event_after_execute_, stream_));
 
     if (copy_output) {
-      result.output.resize(output_count);
-      PPOCRV6_CUDA_CHECK(cudaEventRecord(event_start, stream_));
-      PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(result.output.data(),
+      PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(host_output_.get(),
                                          device_output_.get(),
                                          output_count * sizeof(float),
                                          cudaMemcpyDeviceToHost, stream_));
-      PPOCRV6_CUDA_CHECK(cudaEventRecord(event_stop, stream_));
-      result.d2h_ms = elapsed_event_ms(event_start, event_stop);
-    } else {
-      PPOCRV6_CUDA_CHECK(cudaStreamSynchronize(stream_));
-      result.d2h_ms = 0.0f;
+    }
+    PPOCRV6_CUDA_CHECK(cudaEventRecord(event_after_output_, stream_));
+    PPOCRV6_CUDA_CHECK(cudaEventSynchronize(event_after_output_));
+    result.h2d_ms =
+        input_is_device
+            ? 0.0f
+            : elapsed_event_ms(event_start_, event_after_input_);
+    result.execute_ms =
+        elapsed_event_ms(event_after_input_, event_after_execute_);
+    result.d2h_ms =
+        copy_output
+            ? elapsed_event_ms(event_after_execute_, event_after_output_)
+            : 0.0f;
+    if (copy_output) {
+      result.output.resize(output_count);
+      std::memcpy(result.output.data(), host_output_.get(),
+                  output_count * sizeof(float));
     }
   }
 
@@ -467,9 +510,14 @@ private:
   CudaPtr<unsigned char> context_memory_;
   CudaPtr<float> device_input_;
   CudaPtr<float> device_output_;
+  CudaHostPtr<float> host_output_;
   std::size_t max_input_count_ = 0;
   std::size_t max_output_count_ = 0;
   cudaStream_t stream_ = nullptr;
+  cudaEvent_t event_start_ = nullptr;
+  cudaEvent_t event_after_input_ = nullptr;
+  cudaEvent_t event_after_execute_ = nullptr;
+  cudaEvent_t event_after_output_ = nullptr;
   int active_profile_ = -1;
   mutable std::mutex mutex_;
 };
@@ -483,6 +531,13 @@ DetectionTensorResult DetectionWorker::detect_f32(const float *nchw, int batch,
                                                   int height, int width,
                                                   bool copy_output) {
   return impl_->detect_f32(nchw, batch, height, width, copy_output);
+}
+
+DetectionTensorResult DetectionWorker::detect_device_f32(
+    const float *device_nchw, int batch, int height, int width,
+    bool copy_output, cudaEvent_t input_ready) {
+  return impl_->detect_device_f32(device_nchw, batch, height, width, copy_output,
+                                  input_ready);
 }
 
 std::string DetectionWorker::info_json() const { return impl_->info_json(); }

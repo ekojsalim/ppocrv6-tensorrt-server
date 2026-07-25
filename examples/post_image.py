@@ -16,6 +16,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image", type=Path, required=True)
     parser.add_argument("--kind", choices=["glyph", "ocr"], required=True)
     parser.add_argument("--width", type=int, default=80)
+    parser.add_argument(
+        "--character-policy",
+        choices=["cjk_focus", "cjk_focus_fallback", "suppress_ascii", "all"],
+        help="Glyph vocabulary policy; omitted uses the server default.",
+    )
     parser.add_argument("--json", action="store_true", help="Print the full JSON response.")
     return parser.parse_args()
 
@@ -26,6 +31,8 @@ def main() -> int:
     if args.kind == "glyph":
         url = f"{args.base_url}/v1/glyphs/recognize"
         payload = {"image": encoded, "width": args.width}
+        if args.character_policy is not None:
+            payload["character_policy"] = args.character_policy
     else:
         url = f"{args.base_url}/v1/ocr/recognize"
         payload = {"image": encoded}

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cuda_runtime_api.h>
+
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -44,6 +46,10 @@ public:
 
   DetectionTensorResult detect_f32(const float *nchw, int batch, int height,
                                    int width, bool copy_output);
+  DetectionTensorResult detect_device_f32(const float *device_nchw, int batch,
+                                          int height, int width,
+                                          bool copy_output,
+                                          cudaEvent_t input_ready = nullptr);
 
   [[nodiscard]] std::string info_json() const;
   [[nodiscard]] const DetectionWorkerConfig &config() const noexcept;

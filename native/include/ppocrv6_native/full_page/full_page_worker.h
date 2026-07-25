@@ -41,7 +41,8 @@ struct FullPageWorkerConfig {
     return config;
   }();
   detection::DetectionPostprocessConfig postprocess{};
-  std::vector<int> recognition_buckets{640, 1280, 1600, 2400, 3200};
+  std::vector<int> recognition_buckets{
+      128, 256, 384, 512, 640, 960, 1280, 1600, 2400, 3200};
   int recognition_height = 48;
 };
 

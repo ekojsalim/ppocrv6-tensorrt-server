@@ -33,7 +33,13 @@ POST /v1/pages/recognize
 
 `/v1/ocr/info` returns native detector/recognizer metadata, OCR request limits,
 and detector preprocess config. For the production-shaped path, native input is
-decoded RGB bytes and C++ owns detector resize/normalize with OpenCV.
+decoded RGB bytes and C++ owns CUDA detector resize/color conversion/normalize.
+OpenCV/Clipper remains responsible for DB postprocessing.
+
+Recognizer metadata includes `shared_engine_use_count`,
+`context_memory_bytes`, and `profile_memory_bytes`. The first identifies shared
+immutable engine/classifier use; the latter two expose the context's current
+allocation and each profile's possible allocation.
 
 Request body for `/v1/ocr/recognize`:
 
@@ -115,13 +121,48 @@ or:
 {
   "images": ["<base64 image>", "<base64 image>"],
   "width": 80,
-  "batch_size": 64,
-  "return_timesteps": false
+  "batch_size": 256,
+  "return_timesteps": false,
+  "character_policy": "cjk_focus_fallback"
 }
 ```
 
 `image` returns a convenience `prediction` field in addition to `predictions`.
 `images` returns one item per input in `predictions`.
+The defaults accept up to 1,024 images in one logical request and execute them
+in TensorRT chunks of up to 256 images.
+
+Glyph recognition defaults to `"character_policy": "cjk_focus_fallback"`.
+Its primary pass uses `cjk_focus`, masking ASCII classifier classes plus
+straight-line tokens visually confusable with CJK strokes: macron `¯`, en dash
+`–`, em dash `—`, horizontal bar `―`, minus sign `−`, horizontal-line
+extension `⎯`, and fullwidth hyphen-minus `－`. Masking happens before
+softmax/argmax and CTC decode, reducing failures such as `一` becoming `_`,
+`-`, or `–`, and `入` becoming `T`.
+
+Set `"character_policy": "suppress_ascii"` for the narrower legacy policy or
+`"character_policy": "all"` to opt out for requests that legitimately contain
+ASCII or the masked line symbols. Character policies are glyph-only; full-page
+OCR always uses the unrestricted vocabulary.
+
+When normal `cjk_focus` CTC decoding is empty, the default policy examines the
+strongest CJK-ideograph alternative without suppressing CTC blank globally.
+The candidate is applied only when its probability in the original
+distribution is at least `0.05` and its probability among CJK-only alternatives
+is at least `0.8`. Responses include `empty_fallback_attempted_count`,
+`empty_fallback_applied_count`, and per-prediction `empty_fallback`
+diagnostics. This policy costs an additional classifier pass only for chunks
+containing an empty decode. Set `"character_policy": "cjk_focus"` to disable
+only this empty-result fallback while retaining the same vocabulary masking.
+
+Suppression does not rewrite punctuation into a guessed CJK character. It lets
+the classifier choose among blank and the remaining classes. In `cjk_focus`
+and `suppress_ascii` modes, and for the primary pass of
+`cjk_focus_fallback`, `score_type` is `conditional_probability`, because scores
+are normalized over the allowed vocabulary; with `"all"` it is `probability`.
+Both `character_policy` and `score_type` are returned at the top level and in
+`meta`. `GET /v1/glyphs/info` reports the configured
+`default_character_policy`.
 
 ## Errors
 

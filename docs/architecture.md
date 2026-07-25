@@ -9,8 +9,8 @@ Rust
   one native call per glyph batch or page request
 
 C++/CUDA/TensorRT
-  model/context lifetime
-  detector preprocessing
+  shared model lifetime and independent worker contexts
+  CUDA detector preprocessing
   detection and DB postprocess
   ROI warp and recognition preprocessing
   recognition bucket execution
@@ -25,12 +25,23 @@ per-kernel scheduling responsibilities.
 The full-page endpoint accepts one encoded image. Rust decodes it to RGB bytes
 and calls the native full-page worker. Native code handles:
 
-1. OpenCV resize/normalize for the detector.
+1. One RGB upload followed by CUDA resize/color conversion/normalize for the
+   detector.
 2. TensorRT detector inference.
 3. OpenCV/Clipper DB postprocess.
 4. CUDA ROI warp/normalize for each detected text crop.
 5. TensorRT hidden recognizer.
 6. CUDA classifier and CTC decode.
+
+The glyph endpoint and full-page pipeline share one deserialized recognizer
+engine, classifier weights, bias, and character table. They keep separate
+execution contexts and streams because requests can overlap and TensorRT
+context state is mutable. New recognizer engines have glyph, short-line, and
+long-line profiles. The runtime filters its preferred recognition buckets
+against the profiles actually present, so older glyph + long-line engines pad
+short lines to the smallest supported line width instead of failing. Each
+context lazily allocates workspace for the smallest-memory profile that accepts
+the current shape and grows if a later request requires more.
 
 ## Glyph Recognition
 

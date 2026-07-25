@@ -213,6 +213,16 @@ int main(int argc, char **argv) {
   glyph.workspace_bytes = workspace_bytes;
   glyph.builder_optimization_level = opt_level;
 
+  ppocrv6_native::engine::RecognitionProfile short_line;
+  short_line.min_batch = int_arg_or(args, "--short-line-min-batch", 1);
+  short_line.opt_batch = int_arg_or(args, "--short-line-opt-batch", 8);
+  short_line.max_batch = int_arg_or(args, "--short-line-max-batch", 12);
+  short_line.min_width = int_arg_or(args, "--short-line-min-width", 128);
+  short_line.opt_width = int_arg_or(args, "--short-line-opt-width", 384);
+  short_line.max_width = int_arg_or(args, "--short-line-max-width", 640);
+  short_line.workspace_bytes = workspace_bytes;
+  short_line.builder_optimization_level = opt_level;
+
   ppocrv6_native::engine::RecognitionProfile line;
   line.min_batch = int_arg_or(args, "--line-min-batch", 1);
   line.opt_batch = int_arg_or(args, "--line-opt-batch", 8);
@@ -225,7 +235,7 @@ int main(int argc, char **argv) {
 
   if (force_rebuild || !std::filesystem::exists(engine_path)) {
     if (!ppocrv6_native::engine::build_recognition_hidden_engine(
-            onnx_path, engine_path, std::vector{glyph, line})) {
+            onnx_path, engine_path, std::vector{glyph, short_line, line})) {
       return 2;
     }
   }
@@ -268,13 +278,20 @@ int main(int argc, char **argv) {
 
   const int glyph_batch = int_arg_or(args, "--inspect-glyph-batch", 128);
   const int glyph_width = int_arg_or(args, "--inspect-glyph-width", 80);
+  const int short_line_batch =
+      int_arg_or(args, "--inspect-short-line-batch", 8);
+  const int short_line_width =
+      int_arg_or(args, "--inspect-short-line-width", 384);
   const int line_batch = int_arg_or(args, "--inspect-line-batch", 4);
   const int line_width = int_arg_or(args, "--inspect-line-width", 3200);
 
   const auto glyph_result = run_shape(*engine, *context, input_name, output_name,
                                       0, glyph_batch, glyph_width, stream);
+  const auto short_line_result =
+      run_shape(*engine, *context, input_name, output_name, 1,
+                short_line_batch, short_line_width, stream);
   const auto line_result = run_shape(*engine, *context, input_name, output_name,
-                                     1, line_batch, line_width, stream);
+                                     2, line_batch, line_width, stream);
   const auto glyph_after_line_result =
       run_shape(*engine, *context, input_name, output_name, 0, glyph_batch,
                 glyph_width, stream);
@@ -317,6 +334,7 @@ int main(int argc, char **argv) {
 
   const std::vector<RunResult> results{
       glyph_result,
+      short_line_result,
       line_result,
       glyph_after_line_result,
   };

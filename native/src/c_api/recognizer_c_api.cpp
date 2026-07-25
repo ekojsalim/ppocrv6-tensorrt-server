@@ -5,6 +5,7 @@
 
 #include <cstdlib>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -47,6 +48,22 @@ ppocrv6_native::recognition::RecognitionWorkerConfig parse_config(
   config.blank_id = json_int_or(json, "blank_id", config.blank_id);
   config.warmup_runs = json_int_or(json, "warmup_runs", config.warmup_runs);
   return config;
+}
+
+ppocrv6_native::recognition::CharacterPolicy parse_character_policy(
+    int character_policy) {
+  switch (character_policy) {
+  case PPOCRV6_CHARACTER_POLICY_ALL:
+    return ppocrv6_native::recognition::CharacterPolicy::kAll;
+  case PPOCRV6_CHARACTER_POLICY_SUPPRESS_ASCII:
+    return ppocrv6_native::recognition::CharacterPolicy::kSuppressAscii;
+  case PPOCRV6_CHARACTER_POLICY_CJK_FOCUS:
+    return ppocrv6_native::recognition::CharacterPolicy::kCjkFocus;
+  case PPOCRV6_CHARACTER_POLICY_CJK_FOCUS_FALLBACK:
+    return ppocrv6_native::recognition::CharacterPolicy::kCjkFocusFallback;
+  default:
+    throw std::invalid_argument("unsupported character policy");
+  }
 }
 
 } // namespace
@@ -95,6 +112,24 @@ extern "C" int ppocrv6_recognizer_recognize_f32(
     const bool include_timesteps = return_timesteps != 0;
     auto result = handle->worker->recognize_f32(
         nchw, count, width, batch_size, include_timesteps);
+    set_output(out_json, ppocrv6_native::recognition::recognition_result_to_json(
+                              result, include_timesteps));
+  });
+}
+
+extern "C" int ppocrv6_recognizer_recognize_f32_with_options(
+    ppocrv6_recognizer *handle, const float *nchw, int count, int width,
+    int batch_size, int return_timesteps, int character_policy,
+    char **out_json, char **out_error) {
+  if (handle == nullptr || handle->worker == nullptr) {
+    set_error(out_error, "recognizer handle is null");
+    return 1;
+  }
+  return ffi_guard(out_error, [&]() {
+    const bool include_timesteps = return_timesteps != 0;
+    auto result = handle->worker->recognize_f32(
+        nchw, count, width, batch_size, include_timesteps,
+        parse_character_policy(character_policy));
     set_output(out_json, ppocrv6_native::recognition::recognition_result_to_json(
                               result, include_timesteps));
   });

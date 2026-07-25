@@ -44,4 +44,13 @@ podman run --rm --device nvidia.com/gpu=all --network host --entrypoint bash \
 The glyph and full-page OCR endpoints share the same recognizer artifacts.
 Full-page OCR is enabled only with `--enable-ocr`.
 
+Glyph requests use `cjk_focus_fallback` by default, masking ASCII and visually
+confusable straight-line punctuation and conservatively recovering strong CJK
+candidates when the normal glyph decode is empty. Select `cjk_focus` to retain
+the masking without empty-result recovery, or `suppress_ascii` for the narrower
+legacy policy. Set
+`"character_policy": "all"` per request, or
+`PPOCRV6_GLYPH_CHARACTER_POLICY=all` for a server-wide default, when glyph
+traffic intentionally contains ASCII. Full-page OCR remains unrestricted.
+
 See [../docs/api.md](../docs/api.md) for request/response details.
