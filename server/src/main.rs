@@ -68,6 +68,9 @@ struct Args {
     )]
     glyph_character_policy: String,
 
+    #[arg(long, env = "PPOCRV6_GLYPH_SCORE_MODE", default_value = "accepted")]
+    glyph_score_mode: String,
+
     #[arg(long, env = "PPOCRV6_GLYPH_HOST", default_value = "127.0.0.1")]
     host: String,
 
@@ -234,6 +237,7 @@ struct Defaults {
     width: i32,
     batch_size: i32,
     character_policy: CharacterPolicy,
+    score_mode: ScoreMode,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -253,6 +257,7 @@ struct RecognizeRequest {
     batch_size: Option<i32>,
     return_timesteps: Option<bool>,
     character_policy: Option<String>,
+    score_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,6 +297,30 @@ impl CharacterPolicy {
             Self::SuppressAscii => "suppress_ascii",
             Self::CjkFocus => "cjk_focus",
             Self::CjkFocusFallback => "cjk_focus_fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+enum ScoreMode {
+    Model = 0,
+    Accepted = 1,
+}
+
+impl ScoreMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "model" => Some(Self::Model),
+            "accepted" => Some(Self::Accepted),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Accepted => "accepted",
         }
     }
 }
@@ -342,6 +371,8 @@ async fn main() -> anyhow::Result<()> {
     validate_args(&args)?;
     let default_character_policy = CharacterPolicy::parse(&args.glyph_character_policy)
         .expect("glyph character policy was validated");
+    let default_score_mode =
+        ScoreMode::parse(&args.glyph_score_mode).expect("glyph score mode was validated");
 
     let native_config = NativeConfig {
         engine_path: &args.engine,
@@ -424,6 +455,7 @@ async fn main() -> anyhow::Result<()> {
             width: args.width,
             batch_size: args.batch_size,
             character_policy: default_character_policy,
+            score_mode: default_score_mode,
         },
         queue_timeout: Duration::from_millis(args.queue_timeout_ms),
     };
@@ -511,6 +543,9 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
             "--glyph-character-policy must be one of cjk_focus, cjk_focus_fallback, suppress_ascii, all"
         );
     }
+    if ScoreMode::parse(&args.glyph_score_mode).is_none() {
+        anyhow::bail!("--glyph-score-mode must be one of accepted, model");
+    }
     validate_limit_type_config(&args.ocr_det_limit_type)?;
     if args.ocr_det_default_height <= 0
         || args.ocr_det_default_width <= 0
@@ -578,16 +613,27 @@ async fn info(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
             json!(state.defaults.character_policy.as_str()),
         );
         map.insert(
+            "default_score_mode".to_string(),
+            json!(state.defaults.score_mode.as_str()),
+        );
+        map.insert(
+            "supported_score_modes".to_string(),
+            json!(["accepted", "model"]),
+        );
+        let model_score_type = match state.defaults.character_policy {
+            CharacterPolicy::All => "probability",
+            CharacterPolicy::SuppressAscii
+            | CharacterPolicy::CjkFocus
+            | CharacterPolicy::CjkFocusFallback => "conditional_probability",
+        };
+        map.insert(
             "score_type".to_string(),
-            json!(match state.defaults.character_policy {
-                CharacterPolicy::All => "probability",
-                CharacterPolicy::SuppressAscii
-                | CharacterPolicy::CjkFocus
-                | CharacterPolicy::CjkFocusFallback => {
-                    "conditional_probability"
-                }
+            json!(match state.defaults.score_mode {
+                ScoreMode::Accepted => "binary_acceptance",
+                ScoreMode::Model => model_score_type,
             }),
         );
+        map.insert("model_score_type".to_string(), json!(model_score_type));
         map.insert(
             "score_types_by_character_policy".to_string(),
             json!({
@@ -675,6 +721,12 @@ fn recognize_blocking(state: AppState, payload: RecognizeRequest) -> Result<Valu
         })?,
         None => state.defaults.character_policy,
     };
+    let score_mode = match payload.score_mode.as_deref() {
+        Some(value) => ScoreMode::parse(value).ok_or_else(|| {
+            ApiError::bad_request("'score_mode' must be one of 'accepted' or 'model'")
+        })?,
+        None => state.defaults.score_mode,
+    };
     let single_image_request = payload.image.is_some() && payload.images.is_none();
     let image_values = extract_images(payload.image, payload.images, state.limits.max_images)?;
     let width = optional_int(
@@ -713,6 +765,7 @@ fn recognize_blocking(state: AppState, payload: RecognizeRequest) -> Result<Valu
             batch_size,
             return_timesteps,
             character_policy as i32,
+            score_mode as i32,
         )
         .map_err(|err| ApiError::internal(err.to_string()))?;
     let blocking_ms = request_started.elapsed().as_secs_f64() * 1000.0;
@@ -1272,12 +1325,13 @@ fn attach_ocr_rust_timings(
 mod tests {
     use clap::Parser;
 
-    use super::{Args, CharacterPolicy};
+    use super::{Args, CharacterPolicy, ScoreMode};
 
     #[test]
-    fn defaults_to_cjk_focus_fallback() {
+    fn defaults_to_cjk_focus_fallback_and_accepted_scores() {
         let args = Args::try_parse_from(["ppocrv6-tensorrt-server"]).unwrap();
         assert_eq!(args.glyph_character_policy, "cjk_focus_fallback");
+        assert_eq!(args.glyph_score_mode, "accepted");
     }
 
     #[test]
@@ -1308,5 +1362,12 @@ mod tests {
         );
         assert_eq!(CharacterPolicy::parse("all"), Some(CharacterPolicy::All));
         assert_eq!(CharacterPolicy::parse("cjk"), None);
+    }
+
+    #[test]
+    fn parses_score_modes() {
+        assert_eq!(ScoreMode::parse("accepted"), Some(ScoreMode::Accepted));
+        assert_eq!(ScoreMode::parse("model"), Some(ScoreMode::Model));
+        assert_eq!(ScoreMode::parse("probability"), None);
     }
 }

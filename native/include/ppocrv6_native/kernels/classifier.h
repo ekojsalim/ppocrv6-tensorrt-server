@@ -35,4 +35,11 @@ void cuda_linear_argmax_prob_wmma(
     int vocab_size, int vocab_tile_size, int *partial_ids, float *partial_max,
     float *partial_sum, cudaStream_t stream = nullptr);
 
+void cuda_linear_argmax_prob_wmma_mode(
+    const half *hidden, const half *weight, const half *bias, int *out_indices,
+    float *out_prob, float *out_max_logits, int rows, int hidden_size,
+    int vocab_size, int vocab_tile_size, int *partial_ids, float *partial_max,
+    float *partial_sum, bool calculate_probability,
+    cudaStream_t stream = nullptr);
+
 } // namespace ppocrv6_native::kernels

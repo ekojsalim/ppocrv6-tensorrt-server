@@ -123,7 +123,8 @@ or:
   "width": 80,
   "batch_size": 256,
   "return_timesteps": false,
-  "character_policy": "cjk_focus_fallback"
+  "character_policy": "cjk_focus_fallback",
+  "score_mode": "accepted"
 }
 ```
 
@@ -156,13 +157,32 @@ containing an empty decode. Set `"character_policy": "cjk_focus"` to disable
 only this empty-result fallback while retaining the same vocabulary masking.
 
 Suppression does not rewrite punctuation into a guessed CJK character. It lets
-the classifier choose among blank and the remaining classes. In `cjk_focus`
-and `suppress_ascii` modes, and for the primary pass of
-`cjk_focus_fallback`, `score_type` is `conditional_probability`, because scores
-are normalized over the allowed vocabulary; with `"all"` it is `probability`.
-Both `character_policy` and `score_type` are returned at the top level and in
-`meta`. `GET /v1/glyphs/info` reports the configured
-`default_character_policy`.
+the classifier choose among blank and the remaining classes.
+
+Glyph recognition defaults to `"score_mode": "accepted"`. Any non-empty result
+accepted by the character/fallback policy returns `score: 1.0` and
+`per_char_scores` of `1.0`; an empty result remains `0.0`. Its `score_type` is
+`binary_acceptance`, not a calibrated probability. This prevents generic
+client-side probability thresholds from discarding low-confidence but
+policy-approved glyphs.
+
+Accepted mode is also a classifier optimization: normal chunks skip the
+vocabulary-wide exponential/sum reduction and probability device-to-host copy.
+If a `cjk_focus_fallback` primary decode is empty, the server still calculates
+real probabilities internally for the fallback's minimum-score gates. Those
+values remain visible in the per-prediction `empty_fallback` diagnostics.
+
+Set `"score_mode": "model"` when the caller needs model confidence. In that
+mode, `cjk_focus`, `suppress_ascii`, and the primary pass of
+`cjk_focus_fallback` use `score_type: "conditional_probability"` because scores
+are normalized over the allowed vocabulary; `"all"` uses
+`score_type: "probability"`. `model_score_type` reports which of those
+probability interpretations applies even when accepted mode is active.
+
+`character_policy`, `score_mode`, `score_type`, and `model_score_type` are
+returned at the top level and in `meta`. `GET /v1/glyphs/info` reports
+`default_character_policy`, `default_score_mode`, and
+`supported_score_modes`.
 
 ## Errors
 

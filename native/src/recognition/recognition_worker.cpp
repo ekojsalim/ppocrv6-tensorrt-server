@@ -43,6 +43,10 @@ const char *character_policy_name(CharacterPolicy policy) noexcept {
   }
 }
 
+const char *score_mode_name(ScoreMode mode) noexcept {
+  return mode == ScoreMode::kAccepted ? "accepted" : "model";
+}
+
 namespace {
 
 constexpr float kEmptyFallbackMinScore = 0.05f;
@@ -511,7 +515,8 @@ public:
   RecognitionBatchResult recognize_f32(const float *nchw, int count, int width,
                                        int batch_size,
                                        bool return_timesteps,
-                                       CharacterPolicy character_policy) {
+                                       CharacterPolicy character_policy,
+                                       ScoreMode score_mode) {
     if (nchw == nullptr) {
       throw std::runtime_error("input tensor pointer is null");
     }
@@ -531,6 +536,7 @@ public:
     result.width = width;
     result.batch_size = batch_size;
     result.character_policy = character_policy;
+    result.score_mode = score_mode;
     result.predictions.reserve(static_cast<std::size_t>(count));
     const auto started = std::chrono::steady_clock::now();
 
@@ -539,7 +545,8 @@ public:
     for (int start = 0; start < count; start += batch_size) {
       const int chunk_count = std::min(batch_size, count - start);
       run_chunk(nchw + static_cast<std::size_t>(start) * image_stride,
-                chunk_count, width, return_timesteps, character_policy, result);
+                chunk_count, width, return_timesteps, character_policy,
+                score_mode, result);
     }
     PPOCRV6_CUDA_CHECK(cudaStreamSynchronize(stream_));
 
@@ -552,7 +559,8 @@ public:
                                               int count, int width,
                                               int batch_size,
                                               bool return_timesteps,
-                                              CharacterPolicy character_policy) {
+                                              CharacterPolicy character_policy,
+                                              ScoreMode score_mode) {
     if (device_nchw == nullptr) {
       throw std::runtime_error("device input tensor pointer is null");
     }
@@ -568,13 +576,13 @@ public:
 
     return recognize_device_f32_on_stream(device_nchw, count, width, batch_size,
                                           return_timesteps, stream_,
-                                          character_policy);
+                                          character_policy, score_mode);
   }
 
   RecognitionBatchResult recognize_device_f32_on_stream(
       const float *device_nchw, int count, int width, int batch_size,
       bool return_timesteps, cudaStream_t stream,
-      CharacterPolicy character_policy) {
+      CharacterPolicy character_policy, ScoreMode score_mode) {
     if (stream == nullptr) {
       throw std::runtime_error("recognition CUDA stream is null");
     }
@@ -597,6 +605,7 @@ public:
     result.width = width;
     result.batch_size = batch_size;
     result.character_policy = character_policy;
+    result.score_mode = score_mode;
     result.predictions.reserve(static_cast<std::size_t>(count));
     const auto started = std::chrono::steady_clock::now();
 
@@ -607,7 +616,7 @@ public:
       run_chunk_device(device_nchw +
                            static_cast<std::size_t>(start) * image_stride,
                        chunk_count, width, return_timesteps, character_policy,
-                       result, stream);
+                       score_mode, result, stream);
     }
     PPOCRV6_CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -638,7 +647,11 @@ public:
     out << ",\"vocab_size\":" << config_.vocab_size;
     out << ",\"hidden_size\":" << config_.hidden_size;
     out << ",\"vocab_tile_size\":" << config_.vocab_tile_size;
-    out << ",\"score_type\":\"probability\"";
+    out << ",\"supported_score_modes\":[\"accepted\",\"model\"]";
+    out << ",\"accepted_score_type\":\"binary_acceptance\"";
+    out << ",\"model_score_type\":\"probability_or_conditional_probability\"";
+    out << ",\"accepted_probability_calculation\":"
+           "\"skipped_unless_empty_fallback\"";
     out << ",\"supported_character_policies\":[\"cjk_focus\","
            "\"cjk_focus_fallback\",\"suppress_ascii\",\"all\"]";
     out << ",\"ascii_suppressed_class_count\":"
@@ -728,7 +741,7 @@ private:
     PPOCRV6_CUDA_CHECK(
         cudaMemsetAsync(input_.get(), 0, input_count * sizeof(float), stream_));
     for (int i = 0; i < config_.warmup_runs; ++i) {
-      launch_compute(input_.get(), stream_, CharacterPolicy::kAll);
+      launch_compute(input_.get(), stream_, CharacterPolicy::kAll, true);
     }
     PPOCRV6_CUDA_CHECK(cudaStreamSynchronize(stream_));
   }
@@ -806,18 +819,20 @@ private:
     }
   }
 
-  void launch_classifier(const half *classifier_bias, cudaStream_t stream) {
-    kernels::cuda_linear_argmax_prob_wmma(
+  void launch_classifier(const half *classifier_bias, cudaStream_t stream,
+                         bool calculate_probability) {
+    kernels::cuda_linear_argmax_prob_wmma_mode(
         reinterpret_cast<const half *>(hidden_.get()),
         reinterpret_cast<const half *>(resources_->weight.get()),
         classifier_bias, indices_.get(), prob_.get(), max_logits_.get(),
         active_rows_, config_.hidden_size, config_.vocab_size,
         config_.vocab_tile_size, partial_ids_.get(), partial_max_.get(),
-        partial_sum_.get(), stream);
+        partial_sum_.get(), calculate_probability, stream);
   }
 
   void launch_compute(const float *device_input, cudaStream_t stream,
-                      CharacterPolicy character_policy) {
+                      CharacterPolicy character_policy,
+                      bool calculate_probability) {
     if (!context_->setTensorAddress(resources_->input_name.c_str(),
                                     const_cast<float *>(device_input)) ||
         !context_->setTensorAddress(resources_->output_name.c_str(),
@@ -827,12 +842,13 @@ private:
     if (!context_->enqueueV3(stream)) {
       throw std::runtime_error("TensorRT hidden enqueue failed");
     }
-    launch_classifier(classifier_bias_for_policy(character_policy), stream);
+    launch_classifier(classifier_bias_for_policy(character_policy), stream,
+                      calculate_probability);
   }
 
   void run_chunk(const float *chunk_input, int chunk_count, int width,
                  bool return_timesteps, CharacterPolicy character_policy,
-                 RecognitionBatchResult &result) {
+                 ScoreMode score_mode, RecognitionBatchResult &result) {
     set_active_shape(chunk_count, width, stream_);
     const std::size_t input_count =
         static_cast<std::size_t>(chunk_count) * 3U * 48U *
@@ -840,57 +856,74 @@ private:
     PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(input_.get(), chunk_input,
                                        input_count * sizeof(float),
                                        cudaMemcpyHostToDevice, stream_));
-    launch_compute(input_.get(), stream_, character_policy);
+    const bool calculate_probability = score_mode == ScoreMode::kModel;
+    launch_compute(input_.get(), stream_, character_policy,
+                   calculate_probability);
 
     const std::size_t rows = static_cast<std::size_t>(active_rows_);
     PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(host_indices_.get(), indices_.get(),
                                        rows * sizeof(int),
                                        cudaMemcpyDeviceToHost, stream_));
-    PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(host_prob_.get(), prob_.get(),
-                                       rows * sizeof(float),
-                                       cudaMemcpyDeviceToHost, stream_));
-    if (character_policy == CharacterPolicy::kCjkFocusFallback) {
+    if (calculate_probability) {
+      PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(host_prob_.get(), prob_.get(),
+                                         rows * sizeof(float),
+                                         cudaMemcpyDeviceToHost, stream_));
+    }
+    if (calculate_probability &&
+        character_policy == CharacterPolicy::kCjkFocusFallback) {
       PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(
           host_max_logits_.get(), max_logits_.get(), rows * sizeof(float),
           cudaMemcpyDeviceToHost, stream_));
     }
     PPOCRV6_CUDA_CHECK(cudaStreamSynchronize(stream_));
+    if (!calculate_probability) {
+      std::fill_n(host_prob_.get(), rows, 1.0f);
+    }
 
     append_decoded_predictions(chunk_count, width, return_timesteps, result,
                                std::span<const int>(host_indices_.get(), rows),
                                std::span<const float>(host_prob_.get(), rows),
                                std::span<const float>(host_max_logits_.get(),
                                                       rows),
-                               character_policy, stream_);
+                               character_policy, score_mode, stream_);
   }
 
   void run_chunk_device(const float *device_chunk_input, int chunk_count,
                         int width, bool return_timesteps,
                         CharacterPolicy character_policy,
-                        RecognitionBatchResult &result, cudaStream_t stream) {
+                        ScoreMode score_mode, RecognitionBatchResult &result,
+                        cudaStream_t stream) {
     set_active_shape(chunk_count, width, stream);
-    launch_compute(device_chunk_input, stream, character_policy);
+    const bool calculate_probability = score_mode == ScoreMode::kModel;
+    launch_compute(device_chunk_input, stream, character_policy,
+                   calculate_probability);
 
     const std::size_t rows = static_cast<std::size_t>(active_rows_);
     PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(host_indices_.get(), indices_.get(),
                                        rows * sizeof(int),
                                        cudaMemcpyDeviceToHost, stream));
-    PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(host_prob_.get(), prob_.get(),
-                                       rows * sizeof(float),
-                                       cudaMemcpyDeviceToHost, stream));
-    if (character_policy == CharacterPolicy::kCjkFocusFallback) {
+    if (calculate_probability) {
+      PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(host_prob_.get(), prob_.get(),
+                                         rows * sizeof(float),
+                                         cudaMemcpyDeviceToHost, stream));
+    }
+    if (calculate_probability &&
+        character_policy == CharacterPolicy::kCjkFocusFallback) {
       PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(
           host_max_logits_.get(), max_logits_.get(), rows * sizeof(float),
           cudaMemcpyDeviceToHost, stream));
     }
     PPOCRV6_CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (!calculate_probability) {
+      std::fill_n(host_prob_.get(), rows, 1.0f);
+    }
 
     append_decoded_predictions(chunk_count, width, return_timesteps, result,
                                std::span<const int>(host_indices_.get(), rows),
                                std::span<const float>(host_prob_.get(), rows),
                                std::span<const float>(host_max_logits_.get(),
                                                       rows),
-                               character_policy, stream);
+                               character_policy, score_mode, stream);
   }
 
   void append_decoded_predictions(int chunk_count, int width,
@@ -900,6 +933,7 @@ private:
                                   std::span<const float> scores,
                                   std::span<const float> max_logits,
                                   CharacterPolicy character_policy,
+                                  ScoreMode score_mode,
                                   cudaStream_t stream) {
     auto decoded = ctc_greedy_decode_batch(
         ids, scores, chunk_count, active_timesteps_, resources_->characters,
@@ -912,9 +946,21 @@ private:
                       return value.text.empty();
                     });
     if (try_empty_fallback) {
+      if (score_mode == ScoreMode::kAccepted) {
+        launch_classifier(classifier_bias_for_policy(character_policy), stream,
+                          true);
+        const std::size_t rows = static_cast<std::size_t>(active_rows_);
+        PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(
+            host_prob_.get(), prob_.get(), rows * sizeof(float),
+            cudaMemcpyDeviceToHost, stream));
+        PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(
+            host_max_logits_.get(), max_logits_.get(), rows * sizeof(float),
+            cudaMemcpyDeviceToHost, stream));
+        PPOCRV6_CUDA_CHECK(cudaStreamSynchronize(stream));
+      }
       launch_classifier(reinterpret_cast<const half *>(
                             resources_->cjk_ideograph_nonblank_bias.get()),
-                        stream);
+                        stream, true);
       const std::size_t rows = static_cast<std::size_t>(active_rows_);
       PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(
           host_fallback_indices_.get(), indices_.get(), rows * sizeof(int),
@@ -931,7 +977,9 @@ private:
     result.chunks.push_back(
         RecognitionChunkMeta{chunk_count, width, active_timesteps_});
     result.output_bytes +=
-        static_cast<std::size_t>(active_rows_) * (sizeof(int) + sizeof(float));
+        static_cast<std::size_t>(active_rows_) *
+        (sizeof(int) +
+         (score_mode == ScoreMode::kModel ? sizeof(float) : 0U));
     for (int row = 0; row < chunk_count; ++row) {
       RecognitionPrediction prediction;
       prediction.decoded = std::move(decoded[static_cast<std::size_t>(row)]);
@@ -988,6 +1036,12 @@ private:
               prediction.empty_fallback_score};
         }
       }
+      if (score_mode == ScoreMode::kAccepted &&
+          !prediction.decoded.text.empty()) {
+        prediction.decoded.score = 1.0f;
+        std::fill(prediction.decoded.per_char_scores.begin(),
+                  prediction.decoded.per_char_scores.end(), 1.0f);
+      }
       if (return_timesteps) {
         const std::size_t start =
             static_cast<std::size_t>(row) *
@@ -995,10 +1049,15 @@ private:
         prediction.timestep_class_ids.assign(
             ids.begin() + static_cast<std::ptrdiff_t>(start),
             ids.begin() + static_cast<std::ptrdiff_t>(start + active_timesteps_));
-        prediction.timestep_scores.assign(
-            scores.begin() + static_cast<std::ptrdiff_t>(start),
-            scores.begin() +
-                static_cast<std::ptrdiff_t>(start + active_timesteps_));
+        if (score_mode == ScoreMode::kAccepted) {
+          prediction.timestep_scores.assign(
+              static_cast<std::size_t>(active_timesteps_), 1.0f);
+        } else {
+          prediction.timestep_scores.assign(
+              scores.begin() + static_cast<std::ptrdiff_t>(start),
+              scores.begin() +
+                  static_cast<std::ptrdiff_t>(start + active_timesteps_));
+        }
       }
       result.predictions.push_back(std::move(prediction));
     }
@@ -1045,25 +1104,28 @@ RecognitionWorker::~RecognitionWorker() = default;
 
 RecognitionBatchResult RecognitionWorker::recognize_f32(
     const float *nchw, int count, int width, int batch_size,
-    bool return_timesteps, CharacterPolicy character_policy) {
+    bool return_timesteps, CharacterPolicy character_policy,
+    ScoreMode score_mode) {
   return impl_->recognize_f32(nchw, count, width, batch_size,
-                              return_timesteps, character_policy);
+                              return_timesteps, character_policy, score_mode);
 }
 
 RecognitionBatchResult RecognitionWorker::recognize_device_f32(
     const float *device_nchw, int count, int width, int batch_size,
-    bool return_timesteps, CharacterPolicy character_policy) {
+    bool return_timesteps, CharacterPolicy character_policy,
+    ScoreMode score_mode) {
   return impl_->recognize_device_f32(device_nchw, count, width, batch_size,
-                                     return_timesteps, character_policy);
+                                     return_timesteps, character_policy,
+                                     score_mode);
 }
 
 RecognitionBatchResult RecognitionWorker::recognize_device_f32_on_stream(
     const float *device_nchw, int count, int width, int batch_size,
     bool return_timesteps, cudaStream_t stream,
-    CharacterPolicy character_policy) {
+    CharacterPolicy character_policy, ScoreMode score_mode) {
   return impl_->recognize_device_f32_on_stream(
       device_nchw, count, width, batch_size, return_timesteps, stream,
-      character_policy);
+      character_policy, score_mode);
 }
 
 std::string RecognitionWorker::info_json() const { return impl_->info_json(); }
@@ -1112,13 +1174,18 @@ std::string recognition_result_to_json(const RecognitionBatchResult &result,
   }
   out << ']';
   out << ",\"output_bytes\":" << result.output_bytes;
-  const char *score_type =
+  const char *model_score_type =
       result.character_policy == CharacterPolicy::kAll
           ? "probability"
           : "conditional_probability";
+  const char *score_type = result.score_mode == ScoreMode::kAccepted
+                               ? "binary_acceptance"
+                               : model_score_type;
   out << ",\"character_policy\":\""
       << character_policy_name(result.character_policy) << '"';
+  out << ",\"score_mode\":\"" << score_mode_name(result.score_mode) << '"';
   out << ",\"score_type\":\"" << score_type << '"';
+  out << ",\"model_score_type\":\"" << model_score_type << '"';
   out << ",\"empty_fallback_attempted_count\":"
       << result.empty_fallback_attempted_count;
   out << ",\"empty_fallback_applied_count\":"
@@ -1138,7 +1205,9 @@ std::string recognition_result_to_json(const RecognitionBatchResult &result,
   out << ",\"batch_size\":" << result.batch_size;
   out << ",\"character_policy\":\""
       << character_policy_name(result.character_policy) << '"';
+  out << ",\"score_mode\":\"" << score_mode_name(result.score_mode) << '"';
   out << ",\"score_type\":\"" << score_type << '"';
+  out << ",\"model_score_type\":\"" << model_score_type << '"';
   out << ",\"empty_fallback_attempted_count\":"
       << result.empty_fallback_attempted_count;
   out << ",\"empty_fallback_applied_count\":"

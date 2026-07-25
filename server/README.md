@@ -53,4 +53,11 @@ legacy policy. Set
 `PPOCRV6_GLYPH_CHARACTER_POLICY=all` for a server-wide default, when glyph
 traffic intentionally contains ASCII. Full-page OCR remains unrestricted.
 
+Glyph scores default to `"score_mode": "accepted"`: non-empty predictions have
+`score: 1.0`, empty predictions remain `0.0`, and the native classifier skips
+the probability reduction on normal chunks. Set `"score_mode": "model"` per
+request, or `PPOCRV6_GLYPH_SCORE_MODE=model` server-wide, to return model
+probabilities. The empty-result fallback still calculates real probabilities
+internally for its acceptance gates. Full-page OCR scores are unchanged.
+
 See [../docs/api.md](../docs/api.md) for request/response details.

@@ -21,6 +21,11 @@ def parse_args() -> argparse.Namespace:
         choices=["cjk_focus", "cjk_focus_fallback", "suppress_ascii", "all"],
         help="Glyph vocabulary policy; omitted uses the server default.",
     )
+    parser.add_argument(
+        "--score-mode",
+        choices=["accepted", "model"],
+        help="Glyph score mode; omitted uses the server default.",
+    )
     parser.add_argument("--json", action="store_true", help="Print the full JSON response.")
     return parser.parse_args()
 
@@ -33,6 +38,8 @@ def main() -> int:
         payload = {"image": encoded, "width": args.width}
         if args.character_policy is not None:
             payload["character_policy"] = args.character_policy
+        if args.score_mode is not None:
+            payload["score_mode"] = args.score_mode
     else:
         url = f"{args.base_url}/v1/ocr/recognize"
         payload = {"image": encoded}

@@ -29,6 +29,11 @@ native C++/CUDA/TensorRT runtime.
   with CJK strokes before argmax and CTC decode. Requests can select plain
   `cjk_focus`, `suppress_ascii`, or opt out with `"character_policy": "all"`;
   full-page OCR always uses the full vocabulary.
+- Accepted glyphs return a binary `1.0` score by default so client-side
+  probability thresholds do not discard policy-approved results. This also
+  skips the vocabulary-wide probability reduction on normal glyph chunks;
+  requests that need calibrated model scores can select
+  `"score_mode": "model"`.
 - Public model preparation helpers for downloading PP-OCRv6 ONNX files,
   deriving the hidden recognizer, and exporting classifier weights.
 - Dependency-light generated examples and an end-to-end smoke test.

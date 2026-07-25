@@ -236,7 +236,7 @@ __global__ void linear_argmax_prob_tiled_final_kernel(
     const int *__restrict__ partial_ids, const float *__restrict__ partial_max,
     const float *__restrict__ partial_sum, int *__restrict__ out_indices,
     float *__restrict__ out_prob, float *__restrict__ out_max_logits, int rows,
-    int row_block_size, int num_vocab_blocks) {
+    int row_block_size, int num_vocab_blocks, bool calculate_probability) {
   extern __shared__ unsigned char shared_raw[];
   float *shared_max = reinterpret_cast<float *>(shared_raw);
   int *shared_id = reinterpret_cast<int *>(shared_max +
@@ -295,24 +295,26 @@ __global__ void linear_argmax_prob_tiled_final_kernel(
     __syncthreads();
   }
 
-  for (int lane = 0; lane < row_block_size; ++lane) {
-    const float row_max = shared_max[lane * blockDim.x];
-    const float contribution =
-        local_sum[lane] == 0.0f ? 0.0f
-                                : local_sum[lane] *
-                                      __expf(local_max[lane] - row_max);
-    shared_sum[lane * blockDim.x + tid] = contribution;
-  }
-  __syncthreads();
-
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      for (int lane = 0; lane < row_block_size; ++lane) {
-        const int dst = lane * blockDim.x + tid;
-        shared_sum[dst] += shared_sum[dst + stride];
-      }
+  if (calculate_probability) {
+    for (int lane = 0; lane < row_block_size; ++lane) {
+      const float row_max = shared_max[lane * blockDim.x];
+      const float contribution =
+          local_sum[lane] == 0.0f
+              ? 0.0f
+              : local_sum[lane] * __expf(local_max[lane] - row_max);
+      shared_sum[lane * blockDim.x + tid] = contribution;
     }
     __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        for (int lane = 0; lane < row_block_size; ++lane) {
+          const int dst = lane * blockDim.x + tid;
+          shared_sum[dst] += shared_sum[dst + stride];
+        }
+      }
+      __syncthreads();
+    }
   }
 
   if (tid == 0) {
@@ -324,7 +326,8 @@ __global__ void linear_argmax_prob_tiled_final_kernel(
       const int offset = lane * blockDim.x;
       out_indices[row] = shared_id[offset];
       out_max_logits[row] = shared_max[offset];
-      out_prob[row] = 1.0f / shared_sum[offset];
+      out_prob[row] =
+          calculate_probability ? 1.0f / shared_sum[offset] : 1.0f;
     }
   }
 }
@@ -352,7 +355,7 @@ __global__ void linear_argmax_prob_wmma_partial_kernel(
     const half *__restrict__ bias, int *__restrict__ partial_ids,
     float *__restrict__ partial_max, float *__restrict__ partial_sum, int rows,
     int hidden_size, int vocab_size, int vocab_tile_size,
-    int num_vocab_blocks) {
+    int num_vocab_blocks, bool calculate_probability) {
   extern __shared__ float tile_logits[];
   const int row_block = blockIdx.x;
   const int vocab_block = blockIdx.y;
@@ -451,17 +454,20 @@ __global__ void linear_argmax_prob_wmma_partial_kernel(
     best = __shfl_sync(0xffffffff, best, 0);
 
     float sum = 0.0f;
-    if (row < rows) {
-      for (int col_lane = lane; col_lane < vocab_tile_size;
-           col_lane += warpSize) {
-        const int col = vocab_start + col_lane;
-        if (col >= vocab_size) {
-          continue;
+    if (calculate_probability) {
+      if (row < rows) {
+        for (int col_lane = lane; col_lane < vocab_tile_size;
+             col_lane += warpSize) {
+          const int col = vocab_start + col_lane;
+          if (col >= vocab_size) {
+            continue;
+          }
+          sum +=
+              __expf(tile_logits[warp_id * vocab_tile_size + col_lane] - best);
         }
-        sum += __expf(tile_logits[warp_id * vocab_tile_size + col_lane] - best);
       }
+      sum = warp_reduce_sum(sum);
     }
-    sum = warp_reduce_sum(sum);
 
     if (lane == 0 && row < rows) {
       const int partial_offset =
@@ -552,7 +558,7 @@ void cuda_linear_argmax_prob_tiled(
                                           final_threads, final_shared_bytes,
                                           stream>>>(
       partial_ids, partial_max, partial_sum, out_indices, out_prob,
-      out_max_logits, rows, row_block_size, workspace.num_vocab_blocks);
+      out_max_logits, rows, row_block_size, workspace.num_vocab_blocks, true);
   PPOCRV6_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -561,6 +567,17 @@ void cuda_linear_argmax_prob_wmma(
     float *out_prob, float *out_max_logits, int rows, int hidden_size,
     int vocab_size, int vocab_tile_size, int *partial_ids, float *partial_max,
     float *partial_sum, cudaStream_t stream) {
+  cuda_linear_argmax_prob_wmma_mode(
+      hidden, weight, bias, out_indices, out_prob, out_max_logits, rows,
+      hidden_size, vocab_size, vocab_tile_size, partial_ids, partial_max,
+      partial_sum, true, stream);
+}
+
+void cuda_linear_argmax_prob_wmma_mode(
+    const half *hidden, const half *weight, const half *bias, int *out_indices,
+    float *out_prob, float *out_max_logits, int rows, int hidden_size,
+    int vocab_size, int vocab_tile_size, int *partial_ids, float *partial_max,
+    float *partial_sum, bool calculate_probability, cudaStream_t stream) {
   if (rows <= 0) {
     return;
   }
@@ -586,7 +603,8 @@ void cuda_linear_argmax_prob_wmma(
   linear_argmax_prob_wmma_partial_kernel<<<partial_grid, threads,
                                            partial_shared_bytes, stream>>>(
       hidden, weight, bias, partial_ids, partial_max, partial_sum, rows,
-      hidden_size, vocab_size, vocab_tile_size, workspace.num_vocab_blocks);
+      hidden_size, vocab_size, vocab_tile_size, workspace.num_vocab_blocks,
+      calculate_probability);
   PPOCRV6_CUDA_CHECK(cudaGetLastError());
 
   const int final_threads = next_power_of_two(workspace.num_vocab_blocks);
@@ -600,7 +618,8 @@ void cuda_linear_argmax_prob_wmma(
                                           final_threads, final_shared_bytes,
                                           stream>>>(
       partial_ids, partial_max, partial_sum, out_indices, out_prob,
-      out_max_logits, rows, kWmmaRowsPerBlock, workspace.num_vocab_blocks);
+      out_max_logits, rows, kWmmaRowsPerBlock, workspace.num_vocab_blocks,
+      calculate_probability);
   PPOCRV6_CUDA_CHECK(cudaGetLastError());
 }
 

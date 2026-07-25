@@ -124,6 +124,7 @@ def make_image_payload(
     width: int,
     batch_size: int,
     character_policy: str,
+    score_mode: str,
 ) -> dict[str, Any]:
     selected = [images[i % len(images)] for i in range(count)]
     return {
@@ -131,6 +132,7 @@ def make_image_payload(
         "width": width,
         "batch_size": batch_size,
         "character_policy": character_policy,
+        "score_mode": score_mode,
     }
 
 
@@ -161,11 +163,14 @@ def run_case(
     width: int,
     batch_size: int,
     character_policy: str,
+    score_mode: str,
     warmups: int,
     repeats: int,
     timeout: float,
 ) -> dict[str, Any]:
-    payload = make_image_payload(images, count, width, batch_size, character_policy)
+    payload = make_image_payload(
+        images, count, width, batch_size, character_policy, score_mode
+    )
     for _ in range(warmups):
         post_json(url, payload, timeout)
 
@@ -231,6 +236,12 @@ def main() -> None:
         choices=["cjk_focus", "cjk_focus_fallback", "suppress_ascii", "all"],
         default="cjk_focus_fallback",
     )
+    parser.add_argument(
+        "--score-mode",
+        choices=["accepted", "model"],
+        default="accepted",
+        help="Use binary accepted scores (default) or calculate model probabilities.",
+    )
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument("--timeout", type=float, default=30.0)
@@ -269,6 +280,7 @@ def main() -> None:
             width=args.width,
             batch_size=args.batch_size,
             character_policy=args.character_policy,
+            score_mode=args.score_mode,
             warmups=args.warmups,
             repeats=args.repeats,
             timeout=args.timeout,

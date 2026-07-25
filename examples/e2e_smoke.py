@@ -153,6 +153,7 @@ def check_glyph(args: argparse.Namespace, glyph_path: Path) -> None:
             "image": image_payload(glyph_path),
             "width": args.glyph_width,
             "character_policy": "all",
+            "score_mode": "accepted",
         },
     )
     write_json(args.json_out, "glyph-response.json", result)
@@ -165,6 +166,10 @@ def check_glyph(args: argparse.Namespace, glyph_path: Path) -> None:
     expect(
         result.get("character_policy") == "all",
         "glyph smoke test did not opt out of ASCII suppression",
+    )
+    expect(
+        result.get("score_mode") == "accepted",
+        "glyph smoke test did not use accepted score mode",
     )
     expect(text == "A", f"glyph fixture decoded as {text!r}, expected 'A'")
     expect(

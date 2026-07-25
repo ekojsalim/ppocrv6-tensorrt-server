@@ -19,6 +19,13 @@ enum class CharacterPolicy {
 
 const char *character_policy_name(CharacterPolicy policy) noexcept;
 
+enum class ScoreMode {
+  kModel = 0,
+  kAccepted = 1,
+};
+
+const char *score_mode_name(ScoreMode mode) noexcept;
+
 struct RecognitionWorkerConfig {
   std::string engine_path = "artifacts/ppocrv6-medium/engines/rec-hidden-multiprofile-glyph-line.trt";
   std::string weight_path = "artifacts/ppocrv6-medium/classifier/weight.fp16.bin";
@@ -61,6 +68,7 @@ struct RecognitionBatchResult {
   int width = 0;
   int batch_size = 0;
   CharacterPolicy character_policy = CharacterPolicy::kAll;
+  ScoreMode score_mode = ScoreMode::kModel;
   double elapsed_ms = 0.0;
   std::size_t output_bytes = 0;
   int empty_fallback_attempted_count = 0;
@@ -81,17 +89,22 @@ public:
                                        int batch_size,
                                        bool return_timesteps,
                                        CharacterPolicy character_policy =
-                                           CharacterPolicy::kAll);
+                                           CharacterPolicy::kAll,
+                                       ScoreMode score_mode =
+                                           ScoreMode::kModel);
   RecognitionBatchResult recognize_device_f32(const float *device_nchw,
                                               int count, int width,
                                               int batch_size,
                                               bool return_timesteps,
                                               CharacterPolicy character_policy =
-                                                  CharacterPolicy::kAll);
+                                                  CharacterPolicy::kAll,
+                                              ScoreMode score_mode =
+                                                  ScoreMode::kModel);
   RecognitionBatchResult recognize_device_f32_on_stream(
       const float *device_nchw, int count, int width, int batch_size,
       bool return_timesteps, cudaStream_t stream,
-      CharacterPolicy character_policy = CharacterPolicy::kAll);
+      CharacterPolicy character_policy = CharacterPolicy::kAll,
+      ScoreMode score_mode = ScoreMode::kModel);
 
   [[nodiscard]] std::string info_json() const;
   [[nodiscard]] const RecognitionWorkerConfig &config() const noexcept;

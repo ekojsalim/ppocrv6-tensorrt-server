@@ -27,6 +27,9 @@ Glyph recognition uses `cjk_focus_fallback` by default, suppressing ASCII and
 straight-line punctuation confusable with CJK strokes and conservatively
 recovering strong CJK candidates from otherwise empty decodes. The generated
 fixture is the ASCII letter `A`, so this smoke example explicitly opts out.
+Glyphs also use accepted scores by default: a non-empty policy-approved result
+has `score: 1.0`. Add `--score-mode model` when inspecting the recognizer's
+actual probability.
 
 Post a generated page sample:
 

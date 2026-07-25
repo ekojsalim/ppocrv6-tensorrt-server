@@ -11,9 +11,10 @@ use serde_json::Value;
 type CreateFn = unsafe extern "C" fn(*const c_char, *mut *mut c_void, *mut *mut c_char) -> c_int;
 type DestroyFn = unsafe extern "C" fn(*mut c_void);
 type InfoFn = unsafe extern "C" fn(*mut c_void, *mut *mut c_char, *mut *mut c_char) -> c_int;
-type RecognizeF32WithOptionsFn = unsafe extern "C" fn(
+type RecognizeF32WithOptionsV2Fn = unsafe extern "C" fn(
     *mut c_void,
     *const c_float,
+    c_int,
     c_int,
     c_int,
     c_int,
@@ -61,7 +62,7 @@ pub struct NativeRecognizer {
     handle: *mut c_void,
     destroy: DestroyFn,
     info_json_fn: InfoFn,
-    recognize_f32_with_options_fn: RecognizeF32WithOptionsFn,
+    recognize_f32_with_options_v2_fn: RecognizeF32WithOptionsV2Fn,
     free_string: FreeStringFn,
 }
 
@@ -123,8 +124,8 @@ impl NativeRecognizer {
         let create: CreateFn = unsafe { *library.get(b"ppocrv6_recognizer_create\0")? };
         let destroy: DestroyFn = unsafe { *library.get(b"ppocrv6_recognizer_destroy\0")? };
         let info_json_fn: InfoFn = unsafe { *library.get(b"ppocrv6_recognizer_info_json\0")? };
-        let recognize_f32_with_options_fn: RecognizeF32WithOptionsFn =
-            unsafe { *library.get(b"ppocrv6_recognizer_recognize_f32_with_options\0")? };
+        let recognize_f32_with_options_v2_fn: RecognizeF32WithOptionsV2Fn =
+            unsafe { *library.get(b"ppocrv6_recognizer_recognize_f32_with_options_v2\0")? };
         let free_string: FreeStringFn =
             unsafe { *library.get(b"ppocrv6_recognizer_free_string\0")? };
 
@@ -142,7 +143,7 @@ impl NativeRecognizer {
             handle,
             destroy,
             info_json_fn,
-            recognize_f32_with_options_fn,
+            recognize_f32_with_options_v2_fn,
             free_string,
         })
     }
@@ -169,11 +170,12 @@ impl NativeRecognizer {
         batch_size: i32,
         return_timesteps: bool,
         character_policy: i32,
+        score_mode: i32,
     ) -> Result<Value> {
         let mut out = ptr::null_mut();
         let mut error = ptr::null_mut();
         let code = unsafe {
-            (self.recognize_f32_with_options_fn)(
+            (self.recognize_f32_with_options_v2_fn)(
                 self.handle,
                 nchw.as_ptr(),
                 count,
@@ -181,6 +183,7 @@ impl NativeRecognizer {
                 batch_size,
                 i32::from(return_timesteps),
                 character_policy,
+                score_mode,
                 &mut out,
                 &mut error,
             )

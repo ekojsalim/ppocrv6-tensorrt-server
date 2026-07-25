@@ -27,9 +27,19 @@ enum {
   PPOCRV6_CHARACTER_POLICY_CJK_FOCUS_FALLBACK = 3,
 };
 
+enum {
+  PPOCRV6_SCORE_MODE_MODEL = 0,
+  PPOCRV6_SCORE_MODE_ACCEPTED = 1,
+};
+
 int ppocrv6_recognizer_recognize_f32_with_options(
     ppocrv6_recognizer *handle, const float *nchw, int count, int width,
     int batch_size, int return_timesteps, int character_policy,
+    char **out_json, char **out_error);
+
+int ppocrv6_recognizer_recognize_f32_with_options_v2(
+    ppocrv6_recognizer *handle, const float *nchw, int count, int width,
+    int batch_size, int return_timesteps, int character_policy, int score_mode,
     char **out_json, char **out_error);
 
 void ppocrv6_recognizer_free_string(char *value);
