@@ -72,6 +72,26 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 if(PPOCRV6_NATIVE_ENABLE_OPENCV_POSTPROCESS)
   find_package(OpenCV QUIET COMPONENTS core imgproc)
+  if(NOT OpenCV_FOUND)
+    find_path(OPENCV_INCLUDE_DIR
+      NAMES opencv2/core.hpp
+      HINTS /usr/include/opencv4 /usr/local/include/opencv4
+    )
+    find_library(OPENCV_CORE_LIBRARY
+      NAMES opencv_core
+      HINTS /usr/lib /usr/local/lib /usr/lib/x86_64-linux-gnu
+    )
+    find_library(OPENCV_IMGPROC_LIBRARY
+      NAMES opencv_imgproc
+      HINTS /usr/lib /usr/local/lib /usr/lib/x86_64-linux-gnu
+    )
+    if(OPENCV_INCLUDE_DIR AND OPENCV_CORE_LIBRARY AND OPENCV_IMGPROC_LIBRARY)
+      set(OpenCV_FOUND ON)
+      set(OpenCV_INCLUDE_DIRS "${OPENCV_INCLUDE_DIR}")
+      set(OpenCV_LIBS "${OPENCV_CORE_LIBRARY}" "${OPENCV_IMGPROC_LIBRARY}")
+      set(OpenCV_VERSION "manual")
+    endif()
+  endif()
   find_path(POLYCLIPPING_INCLUDE_DIR
     NAMES polyclipping/clipper.hpp clipper.hpp
     HINTS /usr/include /usr/local/include
@@ -91,6 +111,7 @@ endif()
 add_library(ppocrv6_native_core STATIC
   src/detection/db_postprocess.cpp
   src/recognition/ctc_decode.cpp
+  src/recognition/glyph_shape.cpp
 )
 target_include_directories(ppocrv6_native_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -114,6 +135,7 @@ if(PPOCRV6_NATIVE_HAVE_OPENCV_POSTPROCESS)
 endif()
 
 add_library(ppocrv6_native_cuda STATIC
+  src/kernels/detector_preprocess.cu
   src/kernels/roi_warp.cu
   src/kernels/classifier.cu
 )
@@ -139,6 +161,18 @@ add_executable(ppocrv6_ctc_smoke
   src/tools/ctc_smoke.cpp
 )
 target_link_libraries(ppocrv6_ctc_smoke PRIVATE
+  ppocrv6_native_core
+)
+
+find_package(Threads REQUIRED)
+add_executable(ppocrv6_trt_workspace_smoke src/tools/trt_workspace_smoke.cpp)
+target_link_libraries(ppocrv6_trt_workspace_smoke PRIVATE
+  ppocrv6_native_core CUDA::cudart Threads::Threads)
+
+add_executable(ppocrv6_glyph_shape_smoke
+  src/tools/glyph_shape_smoke.cpp
+)
+target_link_libraries(ppocrv6_glyph_shape_smoke PRIVATE
   ppocrv6_native_core
 )
 
@@ -248,6 +282,9 @@ if(PPOCRV6_NATIVE_ENABLE_TENSORRT)
     target_link_libraries(ppocrv6_detection_worker_smoke PRIVATE
       ppocrv6_native_trt
     )
+
+    add_executable(ppocrv6_line_recognizer_smoke src/tools/line_recognizer_smoke.cpp)
+    target_link_libraries(ppocrv6_line_recognizer_smoke PRIVATE ppocrv6_native_trt)
 
     add_executable(ppocrv6_full_page_worker_smoke
       src/tools/full_page_worker_smoke.cpp

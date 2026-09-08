@@ -1,4 +1,5 @@
 #pragma once
+#include "ppocrv6_native/c_api/recognizer.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -9,6 +10,10 @@ typedef struct ppocrv6_full_page ppocrv6_full_page;
 int ppocrv6_full_page_create(const char *config_json,
                              ppocrv6_full_page **out_handle,
                              char **out_error);
+
+// Recognition settings come from the supplied worker; its lifetime is shared.
+int ppocrv6_full_page_create_with_recognizer(const char *config_json,
+    ppocrv6_recognizer *recognizer, ppocrv6_full_page **out_handle, char **out_error);
 
 void ppocrv6_full_page_destroy(ppocrv6_full_page *handle);
 

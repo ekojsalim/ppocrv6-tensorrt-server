@@ -1,3 +1,4 @@
+mod lines;
 mod native;
 
 use std::collections::HashMap;
@@ -15,6 +16,7 @@ use axum::Router;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use clap::Parser;
+use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, RgbImage, RgbaImage};
 use native::{FullPageNativeConfig, NativeConfig, NativeFullPage, NativeRecognizer};
 use rayon::prelude::*;
@@ -26,6 +28,23 @@ use tokio::time::timeout;
 #[derive(Debug, Parser)]
 #[command(about = "Native PP-OCRv6 TensorRT HTTP server")]
 struct Args {
+    /// Enable cropped-line recognition without loading the detector. Full OCR also enables lines.
+    #[arg(long, env = "PPOCRV6_ENABLE_LINES")]
+    enable_lines: bool,
+
+    #[arg(long, env = "PPOCRV6_LINES_MAX_IMAGES", default_value_t = 128)]
+    lines_max_images: usize,
+
+    #[arg(long, env = "PPOCRV6_LINES_MAX_TOTAL_BYTES", default_value_t = 16 * 1024 * 1024)]
+    lines_max_total_bytes: usize,
+
+    #[arg(
+        long,
+        env = "PPOCRV6_LINES_MAX_TOTAL_PIXELS",
+        default_value_t = 16_000_000
+    )]
+    lines_max_total_pixels: u64,
+
     #[arg(
         long,
         env = "PPOCRV6_NATIVE_LIB",
@@ -61,6 +80,16 @@ struct Args {
     )]
     characters: String,
 
+    #[arg(
+        long,
+        env = "PPOCRV6_GLYPH_CHARACTER_POLICY",
+        default_value = "cjk_focus_fallback"
+    )]
+    glyph_character_policy: String,
+
+    #[arg(long, env = "PPOCRV6_GLYPH_SCORE_MODE", default_value = "accepted")]
+    glyph_score_mode: String,
+
     #[arg(long, env = "PPOCRV6_GLYPH_HOST", default_value = "127.0.0.1")]
     host: String,
 
@@ -70,7 +99,7 @@ struct Args {
     #[arg(long, env = "PPOCRV6_GLYPH_WIDTH", default_value_t = 80)]
     width: i32,
 
-    #[arg(long, env = "PPOCRV6_GLYPH_BATCH_SIZE", default_value_t = 64)]
+    #[arg(long, env = "PPOCRV6_GLYPH_BATCH_SIZE", default_value_t = 256)]
     batch_size: i32,
 
     #[arg(long, env = "PPOCRV6_GLYPH_MAX_WIDTH", default_value_t = 128)]
@@ -79,7 +108,7 @@ struct Args {
     #[arg(long, env = "PPOCRV6_GLYPH_MAX_BATCH_SIZE", default_value_t = 256)]
     max_batch_size: i32,
 
-    #[arg(long, env = "PPOCRV6_GLYPH_MAX_IMAGES", default_value_t = 256)]
+    #[arg(long, env = "PPOCRV6_GLYPH_MAX_IMAGES", default_value_t = 1024)]
     max_images: usize,
 
     #[arg(long, env = "PPOCRV6_GLYPH_MAX_REQUEST_BYTES", default_value_t = 16 * 1024 * 1024)]
@@ -162,7 +191,7 @@ struct Args {
     #[arg(
         long,
         env = "PPOCRV6_OCR_REC_BUCKETS",
-        default_value = "640,1280,1600,2400,3200"
+        default_value = "128,256,384,512,640,960,1280,1600,2400,3200"
     )]
     ocr_rec_buckets: String,
 
@@ -205,6 +234,7 @@ struct Args {
 struct AppState {
     recognizer: Arc<Mutex<NativeRecognizer>>,
     ocr: Option<Arc<Mutex<NativeFullPage>>>,
+    lines: Option<Arc<lines::LineWorker>>,
     semaphore: Arc<Semaphore>,
     limits: Limits,
     ocr_limits: OcrLimits,
@@ -226,6 +256,8 @@ struct Limits {
 struct Defaults {
     width: i32,
     batch_size: i32,
+    character_policy: CharacterPolicy,
+    score_mode: ScoreMode,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -244,6 +276,8 @@ struct RecognizeRequest {
     width: Option<i32>,
     batch_size: Option<i32>,
     return_timesteps: Option<bool>,
+    character_policy: Option<String>,
+    score_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,6 +289,60 @@ struct OcrRecognizeRequest {
 struct ApiError {
     status: StatusCode,
     message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+enum CharacterPolicy {
+    All = 0,
+    SuppressAscii = 1,
+    CjkFocus = 2,
+    CjkFocusFallback = 3,
+}
+
+impl CharacterPolicy {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "all" => Some(Self::All),
+            "suppress_ascii" | "suppress-ascii" => Some(Self::SuppressAscii),
+            "cjk_focus" | "cjk-focus" => Some(Self::CjkFocus),
+            "cjk_focus_fallback" | "cjk-focus-fallback" => Some(Self::CjkFocusFallback),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::SuppressAscii => "suppress_ascii",
+            Self::CjkFocus => "cjk_focus",
+            Self::CjkFocusFallback => "cjk_focus_fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+enum ScoreMode {
+    Model = 0,
+    Accepted = 1,
+}
+
+impl ScoreMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "model" => Some(Self::Model),
+            "accepted" => Some(Self::Accepted),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Accepted => "accepted",
+        }
+    }
 }
 
 impl ApiError {
@@ -301,6 +389,10 @@ impl IntoResponse for ApiError {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
+    let default_character_policy = CharacterPolicy::parse(&args.glyph_character_policy)
+        .expect("glyph character policy was validated");
+    let default_score_mode =
+        ScoreMode::parse(&args.glyph_score_mode).expect("glyph score mode was validated");
 
     let native_config = NativeConfig {
         engine_path: &args.engine,
@@ -319,6 +411,29 @@ async fn main() -> anyhow::Result<()> {
     };
     let recognizer = NativeRecognizer::load(&args.native_lib, &native_config)?;
     validate_limit_type_config(&args.ocr_det_limit_type)?;
+    let line_worker = if args.enable_lines || args.enable_ocr {
+        let line_config = NativeConfig {
+            engine_path: &args.ocr_rec_engine,
+            default_width: args.ocr_rec_default_width,
+            default_batch_size: args.ocr_rec_batch_size,
+            max_batch_size: args.ocr_rec_max_batch_size,
+            max_width: args.ocr_rec_max_width,
+            warmup_runs: args.ocr_rec_warmup_runs,
+            ..native_config
+        };
+        Some(lines::LineWorker::new(
+            NativeRecognizer::load(&args.native_lib, &line_config)?,
+            &args.ocr_rec_buckets,
+            args.ocr_rec_max_batch_size,
+            args.ocr_rec_max_width,
+            args.lines_max_images,
+            args.lines_max_total_bytes,
+            args.lines_max_total_pixels,
+        )?)
+    } else {
+        None
+    };
+
     let ocr = if args.enable_ocr {
         let full_page_config = FullPageNativeConfig {
             detector_engine_path: &args.ocr_det_engine,
@@ -356,12 +471,19 @@ async fn main() -> anyhow::Result<()> {
         Some(Arc::new(Mutex::new(NativeFullPage::load(
             &args.native_lib,
             &full_page_config,
+            &line_worker
+                .as_ref()
+                .expect("line worker initialized")
+                .recognizer
+                .lock()
+                .unwrap(),
         )?)))
     } else {
         None
     };
     let state = AppState {
         recognizer: Arc::new(Mutex::new(recognizer)),
+        lines: line_worker.map(Arc::new),
         ocr,
         semaphore: Arc::new(Semaphore::new(args.worker_permits)),
         limits: Limits {
@@ -382,6 +504,8 @@ async fn main() -> anyhow::Result<()> {
         defaults: Defaults {
             width: args.width,
             batch_size: args.batch_size,
+            character_policy: default_character_policy,
+            score_mode: default_score_mode,
         },
         queue_timeout: Duration::from_millis(args.queue_timeout_ms),
     };
@@ -396,11 +520,28 @@ async fn main() -> anyhow::Result<()> {
         args.max_request_bytes
     };
 
+    let request_body_limit = if args.enable_lines || args.enable_ocr {
+        request_body_limit.max(
+            args.lines_max_total_bytes
+                .saturating_mul(4)
+                .saturating_div(3)
+                .saturating_add(args.lines_max_images.saturating_mul(256))
+                .saturating_add(4096),
+        )
+    } else {
+        request_body_limit
+    };
+
     let app = Router::new()
         .route("/health", get(health).options(options_ok))
         .route("/healthz", get(health).options(options_ok))
         .route("/v1/glyphs/info", get(info).options(options_ok))
         .route("/v1/glyphs/recognize", post(recognize).options(options_ok))
+        .route("/v1/lines/info", get(lines::info).options(options_ok))
+        .route(
+            "/v1/lines/recognize",
+            post(lines::recognize).options(options_ok),
+        )
         .route("/v1/ocr/info", get(ocr_info).options(options_ok))
         .route("/v1/ocr/recognize", post(ocr_recognize).options(options_ok))
         .route(
@@ -413,11 +554,49 @@ async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!(
-        "{{\"event\":\"startup\",\"listening\":\"http://{}\",\"glyph_recognize\":\"http://{}/v1/glyphs/recognize\",\"ocr_enabled\":{},\"ocr_recognize\":\"http://{}/v1/ocr/recognize\"}}",
-        addr, addr, args.enable_ocr, addr
+        "{}",
+        json!({
+            "event": "startup", "listening": format!("http://{addr}"),
+            "glyph_recognize": format!("http://{addr}/v1/glyphs/recognize"),
+            "ocr_enabled": args.enable_ocr,
+            "ocr_recognize": format!("http://{addr}/v1/ocr/recognize"),
+            "lines_enabled": args.enable_lines || args.enable_ocr,
+            "lines_recognize": format!("http://{addr}/v1/lines/recognize"),
+        })
     );
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            eprintln!("failed to install Ctrl-C shutdown handler: {err}");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                eprintln!("failed to install SIGTERM shutdown handler: {err}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 fn validate_args(args: &Args) -> anyhow::Result<()> {
@@ -432,6 +611,14 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
     }
     if args.worker_permits == 0 {
         anyhow::bail!("--worker-permits must be positive");
+    }
+    if CharacterPolicy::parse(&args.glyph_character_policy).is_none() {
+        anyhow::bail!(
+            "--glyph-character-policy must be one of cjk_focus, cjk_focus_fallback, suppress_ascii, all"
+        );
+    }
+    if ScoreMode::parse(&args.glyph_score_mode).is_none() {
+        anyhow::bail!("--glyph-score-mode must be one of accepted, model");
     }
     validate_limit_type_config(&args.ocr_det_limit_type)?;
     if args.ocr_det_default_height <= 0
@@ -495,6 +682,41 @@ async fn info(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
         .map_err(|err| ApiError::internal(err.to_string()))?;
     if let Value::Object(map) = &mut info {
         map.insert("limits".to_string(), json!(state.limits));
+        map.insert(
+            "default_character_policy".to_string(),
+            json!(state.defaults.character_policy.as_str()),
+        );
+        map.insert(
+            "default_score_mode".to_string(),
+            json!(state.defaults.score_mode.as_str()),
+        );
+        map.insert(
+            "supported_score_modes".to_string(),
+            json!(["accepted", "model"]),
+        );
+        let model_score_type = match state.defaults.character_policy {
+            CharacterPolicy::All => "probability",
+            CharacterPolicy::SuppressAscii
+            | CharacterPolicy::CjkFocus
+            | CharacterPolicy::CjkFocusFallback => "conditional_probability",
+        };
+        map.insert(
+            "score_type".to_string(),
+            json!(match state.defaults.score_mode {
+                ScoreMode::Accepted => "binary_acceptance",
+                ScoreMode::Model => model_score_type,
+            }),
+        );
+        map.insert("model_score_type".to_string(), json!(model_score_type));
+        map.insert(
+            "score_types_by_character_policy".to_string(),
+            json!({
+                "cjk_focus": "conditional_probability",
+                "cjk_focus_fallback": "conditional_probability",
+                "suppress_ascii": "conditional_probability",
+                "all": "probability",
+            }),
+        );
     }
     Ok(Json(info))
 }
@@ -565,6 +787,20 @@ async fn ocr_recognize(
 
 fn recognize_blocking(state: AppState, payload: RecognizeRequest) -> Result<Value, ApiError> {
     let request_started = Instant::now();
+    let character_policy = match payload.character_policy.as_deref() {
+        Some(value) => CharacterPolicy::parse(value).ok_or_else(|| {
+            ApiError::bad_request(
+                "'character_policy' must be one of 'cjk_focus', 'cjk_focus_fallback', 'suppress_ascii', or 'all'",
+            )
+        })?,
+        None => state.defaults.character_policy,
+    };
+    let score_mode = match payload.score_mode.as_deref() {
+        Some(value) => ScoreMode::parse(value).ok_or_else(|| {
+            ApiError::bad_request("'score_mode' must be one of 'accepted' or 'model'")
+        })?,
+        None => state.defaults.score_mode,
+    };
     let single_image_request = payload.image.is_some() && payload.images.is_none();
     let image_values = extract_images(payload.image, payload.images, state.limits.max_images)?;
     let width = optional_int(
@@ -602,6 +838,8 @@ fn recognize_blocking(state: AppState, payload: RecognizeRequest) -> Result<Valu
             width,
             batch_size,
             return_timesteps,
+            character_policy as i32,
+            score_mode as i32,
         )
         .map_err(|err| ApiError::internal(err.to_string()))?;
     let blocking_ms = request_started.elapsed().as_secs_f64() * 1000.0;
@@ -943,53 +1181,109 @@ fn write_preprocessed_image(
     width: usize,
     out: &mut [f32],
 ) -> Result<(), ApiError> {
-    let target_h = 48_u32;
-    let image_w = image.width();
-    let image_h = image.height();
-    let resized_w = width.min(
-        ((u64::from(target_h) * u64::from(image_w) + u64::from(image_h) - 1) / u64::from(image_h))
-            as usize,
-    );
-    let resized_w = resized_w.max(1);
+    let layout = glyph_resize_layout(image.width(), image.height(), width);
     let plane = 48 * width;
     if out.len() != 3 * plane {
         return Err(ApiError::internal("preprocess output slice has wrong size"));
     }
-    if image.width() == resized_w as u32 && image.height() == target_h {
-        write_rgb_tensor(image, width, resized_w, out);
+
+    if layout.resized_height < 48 {
+        fill_active_canvas_white(width, layout.resized_width, out);
+        let resized = image::imageops::resize(
+            image,
+            layout.resized_width as u32,
+            layout.resized_height as u32,
+            FilterType::Lanczos3,
+        );
+        write_rgb_tensor(&resized, width, layout, out);
         return Ok(());
     }
-    write_resized_rgb_tensor(image, width, resized_w, out);
+    if image.width() == layout.resized_width as u32
+        && image.height() == layout.resized_height as u32
+    {
+        write_rgb_tensor(image, width, layout, out);
+        return Ok(());
+    }
+    write_resized_rgb_tensor(image, width, layout, out);
     Ok(())
 }
 
-fn write_rgb_tensor(image: &RgbImage, width: usize, resized_w: usize, out: &mut [f32]) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GlyphResizeLayout {
+    resized_width: usize,
+    resized_height: usize,
+    y_offset: usize,
+}
+
+fn glyph_resize_layout(image_width: u32, image_height: u32, width: usize) -> GlyphResizeLayout {
+    debug_assert!(image_width > 0);
+    debug_assert!(image_height > 0);
+    debug_assert!(width > 0);
+
+    let image_width = u64::from(image_width);
+    let image_height = u64::from(image_height);
+    let target_height = 48_u64;
+    let target_width = width as u64;
+    let height_normalized_width = (target_height * image_width).div_ceil(image_height).max(1);
+
+    if height_normalized_width <= target_width {
+        return GlyphResizeLayout {
+            resized_width: height_normalized_width as usize,
+            resized_height: target_height as usize,
+            y_offset: 0,
+        };
+    }
+
+    let resized_height = ((target_width * image_height + image_width / 2) / image_width)
+        .clamp(1, target_height) as usize;
+    GlyphResizeLayout {
+        resized_width: width,
+        resized_height,
+        y_offset: (target_height as usize - resized_height) / 2,
+    }
+}
+
+fn fill_active_canvas_white(width: usize, resized_width: usize, out: &mut [f32]) {
     let plane = 48 * width;
-    for y in 0..48_usize {
-        for x in 0..resized_w {
+    for channel in 0..3 {
+        for y in 0..48_usize {
+            out[channel * plane + y * width..channel * plane + y * width + resized_width].fill(1.0);
+        }
+    }
+}
+
+fn write_rgb_tensor(image: &RgbImage, width: usize, layout: GlyphResizeLayout, out: &mut [f32]) {
+    let plane = 48 * width;
+    for y in 0..layout.resized_height {
+        for x in 0..layout.resized_width {
             let pixel = image.get_pixel(x as u32, y as u32);
             for channel in 0..3 {
-                out[channel * plane + y * width + x] =
+                out[channel * plane + (layout.y_offset + y) * width + x] =
                     (f32::from(pixel[channel]) / 255.0 - 0.5) / 0.5;
             }
         }
     }
 }
 
-fn write_resized_rgb_tensor(image: &RgbImage, width: usize, resized_w: usize, out: &mut [f32]) {
+fn write_resized_rgb_tensor(
+    image: &RgbImage,
+    width: usize,
+    layout: GlyphResizeLayout,
+    out: &mut [f32],
+) {
     let plane = 48 * width;
     let src_w = image.width() as usize;
     let src_h = image.height() as usize;
-    let scale_x = src_w as f32 / resized_w as f32;
-    let scale_y = src_h as f32 / 48.0;
+    let scale_x = src_w as f32 / layout.resized_width as f32;
+    let scale_y = src_h as f32 / layout.resized_height as f32;
 
-    for y in 0..48_usize {
+    for y in 0..layout.resized_height {
         let src_y = ((y as f32 + 0.5) * scale_y - 0.5).max(0.0);
         let y0 = (src_y.floor() as usize).min(src_h - 1);
         let y1 = (y0 + 1).min(src_h - 1);
         let wy = src_y - y0 as f32;
 
-        for x in 0..resized_w {
+        for x in 0..layout.resized_width {
             let src_x = ((x as f32 + 0.5) * scale_x - 0.5).max(0.0);
             let x0 = (src_x.floor() as usize).min(src_w - 1);
             let x1 = (x0 + 1).min(src_w - 1);
@@ -1004,7 +1298,7 @@ fn write_resized_rgb_tensor(image: &RgbImage, width: usize, resized_w: usize, ou
                 let top = f32::from(p00[channel]) * (1.0 - wx) + f32::from(p10[channel]) * wx;
                 let bottom = f32::from(p01[channel]) * (1.0 - wx) + f32::from(p11[channel]) * wx;
                 let value = top * (1.0 - wy) + bottom * wy;
-                out[channel * plane + y * width + x] = value / 127.5 - 1.0;
+                out[channel * plane + (layout.y_offset + y) * width + x] = value / 127.5 - 1.0;
             }
         }
     }
@@ -1156,5 +1450,136 @@ fn attach_ocr_rust_timings(
             );
             native_timing.insert("rust_blocking_ms".to_string(), json!(blocking_ms));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use image::{Rgb, RgbImage};
+
+    use super::{
+        glyph_resize_layout, write_preprocessed_image, Args, CharacterPolicy, GlyphResizeLayout,
+        ScoreMode,
+    };
+
+    #[test]
+    fn defaults_to_cjk_focus_fallback_and_accepted_scores() {
+        let args = Args::try_parse_from(["ppocrv6-tensorrt-server"]).unwrap();
+        assert_eq!(args.glyph_character_policy, "cjk_focus_fallback");
+        assert_eq!(args.glyph_score_mode, "accepted");
+    }
+
+    #[test]
+    fn parses_character_policies() {
+        assert_eq!(
+            CharacterPolicy::parse("cjk_focus"),
+            Some(CharacterPolicy::CjkFocus)
+        );
+        assert_eq!(
+            CharacterPolicy::parse("cjk-focus"),
+            Some(CharacterPolicy::CjkFocus)
+        );
+        assert_eq!(
+            CharacterPolicy::parse("cjk_focus_fallback"),
+            Some(CharacterPolicy::CjkFocusFallback)
+        );
+        assert_eq!(
+            CharacterPolicy::parse("cjk-focus-fallback"),
+            Some(CharacterPolicy::CjkFocusFallback)
+        );
+        assert_eq!(
+            CharacterPolicy::parse("suppress_ascii"),
+            Some(CharacterPolicy::SuppressAscii)
+        );
+        assert_eq!(
+            CharacterPolicy::parse("suppress-ascii"),
+            Some(CharacterPolicy::SuppressAscii)
+        );
+        assert_eq!(CharacterPolicy::parse("all"), Some(CharacterPolicy::All));
+        assert_eq!(CharacterPolicy::parse("cjk"), None);
+    }
+
+    #[test]
+    fn parses_score_modes() {
+        assert_eq!(ScoreMode::parse("accepted"), Some(ScoreMode::Accepted));
+        assert_eq!(ScoreMode::parse("model"), Some(ScoreMode::Model));
+        assert_eq!(ScoreMode::parse("probability"), None);
+    }
+
+    #[test]
+    fn glyph_resize_preserves_normal_widths_and_contains_overflow() {
+        assert_eq!(
+            glyph_resize_layout(48, 48, 80),
+            GlyphResizeLayout {
+                resized_width: 48,
+                resized_height: 48,
+                y_offset: 0,
+            }
+        );
+        assert_eq!(
+            glyph_resize_layout(53, 48, 80),
+            GlyphResizeLayout {
+                resized_width: 53,
+                resized_height: 48,
+                y_offset: 0,
+            }
+        );
+        assert_eq!(
+            glyph_resize_layout(191, 48, 80),
+            GlyphResizeLayout {
+                resized_width: 80,
+                resized_height: 20,
+                y_offset: 14,
+            }
+        );
+    }
+
+    #[test]
+    fn glyph_width_overflow_uses_white_vertical_padding() {
+        let image = RgbImage::from_pixel(191, 48, Rgb([0, 0, 0]));
+        let mut tensor = vec![0.0_f32; 3 * 48 * 80];
+        write_preprocessed_image(&image, 80, &mut tensor).unwrap();
+
+        let at = |channel: usize, y: usize, x: usize| tensor[channel * 48 * 80 + y * 80 + x];
+        for channel in 0..3 {
+            assert_eq!(at(channel, 0, 0), 1.0);
+            assert_eq!(at(channel, 13, 79), 1.0);
+            assert_eq!(at(channel, 14, 0), -1.0);
+            assert_eq!(at(channel, 33, 79), -1.0);
+            assert_eq!(at(channel, 34, 0), 1.0);
+            assert_eq!(at(channel, 47, 79), 1.0);
+        }
+    }
+
+    #[test]
+    fn glyph_normal_width_keeps_existing_right_padding() {
+        let image = RgbImage::from_pixel(53, 48, Rgb([0, 0, 0]));
+        let mut tensor = vec![0.0_f32; 3 * 48 * 80];
+        write_preprocessed_image(&image, 80, &mut tensor).unwrap();
+
+        let at = |channel: usize, y: usize, x: usize| tensor[channel * 48 * 80 + y * 80 + x];
+        for channel in 0..3 {
+            assert_eq!(at(channel, 0, 0), -1.0);
+            assert_eq!(at(channel, 47, 52), -1.0);
+            assert_eq!(at(channel, 0, 53), 0.0);
+            assert_eq!(at(channel, 47, 79), 0.0);
+        }
+    }
+
+    #[test]
+    fn glyph_width_overflow_preserves_a_one_pixel_stroke() {
+        let mut image = RgbImage::from_pixel(191, 48, Rgb([255, 255, 255]));
+        for x in 16..175 {
+            image.put_pixel(x, 24, Rgb([0, 0, 0]));
+        }
+        let mut tensor = vec![0.0_f32; 3 * 48 * 80];
+        write_preprocessed_image(&image, 80, &mut tensor).unwrap();
+
+        let darkest = tensor[..48 * 80].iter().copied().fold(1.0_f32, f32::min);
+        assert!(
+            darkest < 0.6,
+            "downsampling erased the one-pixel stroke: darkest={darkest}"
+        );
     }
 }

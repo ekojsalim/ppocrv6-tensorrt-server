@@ -5,25 +5,50 @@ native C++/CUDA/TensorRT runtime.
 
 ## Features
 
-- Rust HTTP server with health, glyph recognition, and full-page OCR endpoints.
+- Rust HTTP server with health, glyph, cropped-line, and full-page OCR endpoints.
 - Request limits, image limits, worker permits, and queue timeout controls at
   the API layer.
-- Coarse C ABI boundary: one native call per glyph batch or page request, with
+- Coarse C ABI boundary: one native call per glyph batch, line chunk, or page request, with
   no CUDA streams, TensorRT contexts, or device pointers exposed to Rust.
 - TensorRT DB detector and TensorRT hidden recognizer workers with long-lived
   engine/context state.
-- Multi-profile recognizer engine for both cropped glyph batches and full-line
-  OCR crops.
+- One shared recognizer engine/classifier allocation with independent execution
+  contexts for glyph traffic and line recognition. Cropped-line and full-page
+  OCR share the same line worker/context and buffers.
+- Recognition profiles tuned for glyphs and OCR lines, with an optional
+  short-line profile in newly built engines. The runtime filters line buckets
+  against the loaded engine. Detector and recognition workers share a reserved
+  enqueue workspace with native synchronization through GPU completion.
+- `POST /v1/lines/recognize` accepts upright single-line crops, automatically
+  groups widths, and preserves input order. Enabled with `--enable-ocr` or
+  independently with `--enable-lines` (no detector required). See
+  [the line API contract](docs/api.md#cropped-line-recognition).
+- CUDA detector resize/color conversion/normalization.
 - CUDA ROI warp and recognition preprocessing for detected text boxes.
 - Custom CUDA classifier and native CTC decode. The recognizer is cut before
   the final PP-OCRv6 classifier, so native code applies the FP16 classifier and
   emits decoded text without materializing the large `[N,T,18710]` logits
   tensor, reducing classifier-stage VRAM pressure.
+- Glyph requests use CJK-focused decoding with a dedicated `一`-only
+  empty-result fallback by default. ASCII and confusable straight-line
+  punctuation are masked before argmax/CTC decode; a blank result is recovered
+  only when a lightweight `一`-vs-blank classifier and a long/thin/horizontal
+  shape test both pass. Requests can select plain `cjk_focus`,
+  `suppress_ascii`, or opt out with `"character_policy": "all"`; full-page OCR
+  always uses the full vocabulary.
+- Accepted glyphs return a binary `1.0` score by default so client-side
+  probability thresholds do not discard policy-approved results. This also
+  skips the vocabulary-wide probability reduction on normal glyph chunks;
+  requests that need calibrated model scores can select
+  `"score_mode": "model"`.
+- Glyph preprocessing preserves aspect ratio on width overflow, containing
+  unusually wide inputs within the recognition tensor instead of squeezing
+  them into artificially thick shapes. Normal near-square glyphs are unchanged.
 - Public model preparation helpers for downloading PP-OCRv6 ONNX files,
   deriving the hidden recognizer, and exporting classifier weights.
 - Dependency-light generated examples and an end-to-end smoke test.
-- TensorRT/CUDA/OpenCV/Clipper container build recipe for reproducible local
-  builds.
+- Standalone TensorRT and vLLM-compatible CUDA 13 / TensorRT 10.14 container
+  build recipes.
 
 The production path is:
 
@@ -32,7 +57,7 @@ Rust HTTP server
   -> base64/image decode, request limits, admission, queue timeout
   -> coarse C ABI call
   -> C++/CUDA/TensorRT full-page worker
-       -> OpenCV detector preprocessing
+       -> one RGB upload + CUDA detector preprocessing
        -> TensorRT DB detector
        -> OpenCV/Clipper DB postprocess
        -> CUDA ROI warp + recognition preprocessing
@@ -79,7 +104,21 @@ examples/             generated sample images and request helpers
 For a complete end-to-end validation checklist, use
 [docs/smoke-test.md](docs/smoke-test.md).
 
-Build the helper image:
+For the local `serve-orchestrator` deployment, build the OCR image on the same
+`vllm-openai:v0.23.0` CUDA 13 lineage:
+
+```bash
+podman build \
+  -f docker/vllm-ocr.Containerfile \
+  -t localhost/ppocrv6-vllm-ocr:dev \
+  .
+```
+
+This compiles and installs both the Rust server and native CUDA/TensorRT
+library. Its engines must also be built with TensorRT 10.14; the orchestrator
+mounts the compatible bundle from `tmp/vllm-ocr-model`.
+
+For standalone development on the newer NGC TensorRT image, build:
 
 ```bash
 podman build \
@@ -135,6 +174,10 @@ podman run --rm --device nvidia.com/gpu=all --network host --entrypoint bash \
 - [docs/build.md](docs/build.md) - build and run commands.
 - [docs/model-artifacts.md](docs/model-artifacts.md) - required model files.
 - [docs/architecture.md](docs/architecture.md) - runtime boundary and portability notes.
+- [Shared workspace validation](docs/shared-workspace-validation.md) - GPU memory reuse and regression checks.
+- [Line endpoint validation](docs/line-endpoint-validation.md) - cropped-line API coverage.
+- [Line profile tuning](docs/line-profile-tuning-results.md) - measured preprocessing and engine-profile tradeoffs.
+- [Detector padding validation](docs/detector-padding-validation.md) - small and extreme-aspect-ratio page handling.
 
 ## License
 

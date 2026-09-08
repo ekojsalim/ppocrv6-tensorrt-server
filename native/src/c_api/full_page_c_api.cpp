@@ -3,6 +3,8 @@
 #include "ppocrv6_native/c_api/common.h"
 #include "ppocrv6_native/full_page/full_page_worker.h"
 
+#include "recognizer_handle.h"
+
 #include <cstdlib>
 #include <memory>
 #include <stdexcept>
@@ -199,4 +201,19 @@ extern "C" int ppocrv6_full_page_recognize_image(
 
 extern "C" void ppocrv6_full_page_free_string(char *value) {
   std::free(value);
+}
+
+extern "C" int ppocrv6_full_page_create_with_recognizer(const char *config_json,
+    ppocrv6_recognizer *recognizer, ppocrv6_full_page **out_handle, char **out_error) {
+  if (!out_handle) { set_error(out_error, "out_handle is null"); return 1; }
+  *out_handle = nullptr;
+  if (!recognizer || !recognizer->worker) {
+    set_error(out_error, "recognizer handle is null"); return 1;
+  }
+  return ffi_guard(out_error, [&]() {
+    auto handle = std::make_unique<ppocrv6_full_page>();
+    handle->worker = std::make_unique<ppocrv6_native::full_page::FullPageWorker>(
+        parse_config(config_json), recognizer->worker);
+    *out_handle = handle.release();
+  });
 }

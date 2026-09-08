@@ -44,4 +44,32 @@ podman run --rm --device nvidia.com/gpu=all --network host --entrypoint bash \
 The glyph and full-page OCR endpoints share the same recognizer artifacts.
 Full-page OCR is enabled only with `--enable-ocr`.
 
+Glyph images are aspect-fitted into the requested width by 48-pixel tensor.
+Normal near-square inputs retain their existing size; only width-overflow
+inputs scale down on both axes and receive white vertical padding. This avoids
+turning unusually wide single strokes into artificially thick bars.
+
+Glyph requests use `cjk_focus_fallback` by default, masking ASCII and visually
+confusable straight-line punctuation. When normal decoding is empty, it checks
+only `一` with a dedicated one-vs-blank classifier plus a long-horizontal-shape
+gate; it never synthesizes another CJK character from blank. Select `cjk_focus`
+to retain the masking without this recovery, or `suppress_ascii` for the
+narrower legacy policy. Set
+`"character_policy": "all"` per request, or
+`PPOCRV6_GLYPH_CHARACTER_POLICY=all` for a server-wide default, when glyph
+traffic intentionally contains ASCII. Full-page OCR remains unrestricted.
+
+The `一` fallback is inexpensive: it evaluates one classifier column against
+the already-known blank logit, then runs a CPU-only shape check over the already
+preprocessed glyph tensor. It does not launch the full vocabulary classifier a
+second time. Responses identify recoveries with
+`empty_fallback.applied_by: "one_stroke"`.
+
+Glyph scores default to `"score_mode": "accepted"`: non-empty predictions have
+`score: 1.0`, empty predictions remain `0.0`, and the native classifier skips
+the probability reduction on normal chunks. Set `"score_mode": "model"` per
+request, or `PPOCRV6_GLYPH_SCORE_MODE=model` server-wide, to return model
+probabilities. The empty-result fallback still calculates real probabilities
+internally for its acceptance gates. Full-page OCR scores are unchanged.
+
 See [../docs/api.md](../docs/api.md) for request/response details.

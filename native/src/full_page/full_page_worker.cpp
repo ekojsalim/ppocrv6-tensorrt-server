@@ -4,6 +4,7 @@
 #include "ppocrv6_native/common/cuda_ptr.h"
 #include "ppocrv6_native/common/perspective.h"
 #include "ppocrv6_native/decode/gpu_image.h"
+#include "ppocrv6_native/kernels/detector_preprocess.h"
 #include "ppocrv6_native/kernels/roi_warp.h"
 
 #include <cuda_runtime.h>
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <iomanip>
 #include <map>
@@ -21,10 +23,6 @@
 #include <utility>
 #include <vector>
 
-#if defined(PPOCRV6_NATIVE_HAVE_OPENCV_POSTPROCESS)
-#include <opencv2/imgproc.hpp>
-#endif
-
 namespace ppocrv6_native::full_page {
 namespace {
 
@@ -34,7 +32,6 @@ double elapsed_ms(std::chrono::steady_clock::time_point start,
 }
 
 float elapsed_event_ms(cudaEvent_t start, cudaEvent_t stop) {
-  PPOCRV6_CUDA_CHECK(cudaEventSynchronize(stop));
   float elapsed = 0.0f;
   PPOCRV6_CUDA_CHECK(cudaEventElapsedTime(&elapsed, start, stop));
   return elapsed;
@@ -121,12 +118,6 @@ const char *limit_type_to_string(DetectorLimitType value) {
   return "max";
 }
 
-struct DetectorInput {
-  int height = 0;
-  int width = 0;
-  std::vector<float> nchw;
-};
-
 std::pair<int, int> detector_resize_shape(
     int src_h, int src_w, const DetectorPreprocessConfig &config) {
   if (src_h <= 0 || src_w <= 0 || config.limit_side_len <= 0 ||
@@ -170,129 +161,6 @@ std::pair<int, int> detector_resize_shape(
   return {resize_h, resize_w};
 }
 
-void write_normalized_bgr_nchw(const std::uint8_t *bgr, int height, int width,
-                               std::size_t stride,
-                               std::vector<float> &out) {
-  const std::size_t plane =
-      static_cast<std::size_t>(height) * static_cast<std::size_t>(width);
-  out.assign(plane * 3U, 0.0f);
-  constexpr float inv255 = 1.0f / 255.0f;
-  constexpr float mean_b = 0.485f;
-  constexpr float mean_g = 0.456f;
-  constexpr float mean_r = 0.406f;
-  constexpr float std_b = 0.229f;
-  constexpr float std_g = 0.224f;
-  constexpr float std_r = 0.225f;
-  for (int y = 0; y < height; ++y) {
-    const auto *row =
-        bgr + static_cast<std::size_t>(y) * static_cast<std::size_t>(stride);
-    for (int x = 0; x < width; ++x) {
-      const std::size_t index =
-          static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
-          static_cast<std::size_t>(x);
-      const auto *pixel = row + static_cast<std::size_t>(x) * 3U;
-      out[index] = (static_cast<float>(pixel[0]) * inv255 - mean_b) / std_b;
-      out[plane + index] =
-          (static_cast<float>(pixel[1]) * inv255 - mean_g) / std_g;
-      out[(2U * plane) + index] =
-          (static_cast<float>(pixel[2]) * inv255 - mean_r) / std_r;
-    }
-  }
-}
-
-DetectorInput preprocess_detector_input_opencv(
-    const std::uint8_t *image, int image_height, int image_width,
-    int image_stride, SourceColorOrder source_color_order,
-    const DetectorPreprocessConfig &config) {
-  const auto [resize_h, resize_w] =
-      detector_resize_shape(image_height, image_width, config);
-
-  DetectorInput out;
-  out.height = resize_h;
-  out.width = resize_w;
-
-#if defined(PPOCRV6_NATIVE_HAVE_OPENCV_POSTPROCESS)
-  cv::Mat source(image_height, image_width, CV_8UC3,
-                 const_cast<std::uint8_t *>(image),
-                 static_cast<std::size_t>(image_stride));
-  cv::Mat bgr;
-  if (source_color_order == SourceColorOrder::kRgb) {
-    cv::cvtColor(source, bgr, cv::COLOR_RGB2BGR);
-  } else {
-    bgr = source;
-  }
-
-  cv::Mat resized;
-  if (resize_h == image_height && resize_w == image_width) {
-    resized = bgr;
-  } else {
-    cv::resize(bgr, resized, cv::Size(resize_w, resize_h), 0.0, 0.0,
-               cv::INTER_LINEAR);
-  }
-  write_normalized_bgr_nchw(resized.data, resize_h, resize_w, resized.step,
-                            out.nchw);
-#else
-  const std::size_t packed_bytes =
-      static_cast<std::size_t>(resize_h) * static_cast<std::size_t>(resize_w) *
-      3U;
-  std::vector<std::uint8_t> resized_bgr(packed_bytes);
-  const float scale_x = static_cast<float>(image_width) /
-                        static_cast<float>(std::max(resize_w, 1));
-  const float scale_y = static_cast<float>(image_height) /
-                        static_cast<float>(std::max(resize_h, 1));
-  for (int y = 0; y < resize_h; ++y) {
-    const float src_y = std::max((static_cast<float>(y) + 0.5f) * scale_y -
-                                     0.5f,
-                                 0.0f);
-    const int y0 = std::min(static_cast<int>(std::floor(src_y)), image_height - 1);
-    const int y1 = std::min(y0 + 1, image_height - 1);
-    const float wy = src_y - static_cast<float>(y0);
-    for (int x = 0; x < resize_w; ++x) {
-      const float src_x =
-          std::max((static_cast<float>(x) + 0.5f) * scale_x - 0.5f, 0.0f);
-      const int x0 =
-          std::min(static_cast<int>(std::floor(src_x)), image_width - 1);
-      const int x1 = std::min(x0 + 1, image_width - 1);
-      const float wx = src_x - static_cast<float>(x0);
-      float values[3] = {0.0f, 0.0f, 0.0f};
-      const int ys[2] = {y0, y1};
-      const int xs[2] = {x0, x1};
-      for (int yy = 0; yy < 2; ++yy) {
-        const float wy_factor = yy == 0 ? (1.0f - wy) : wy;
-        const auto *row = image + static_cast<std::size_t>(ys[yy]) *
-                                      static_cast<std::size_t>(image_stride);
-        for (int xx = 0; xx < 2; ++xx) {
-          const float weight = wy_factor * (xx == 0 ? (1.0f - wx) : wx);
-          const auto *pixel = row + static_cast<std::size_t>(xs[xx]) * 3U;
-          if (source_color_order == SourceColorOrder::kRgb) {
-            values[0] += static_cast<float>(pixel[2]) * weight;
-            values[1] += static_cast<float>(pixel[1]) * weight;
-            values[2] += static_cast<float>(pixel[0]) * weight;
-          } else {
-            values[0] += static_cast<float>(pixel[0]) * weight;
-            values[1] += static_cast<float>(pixel[1]) * weight;
-            values[2] += static_cast<float>(pixel[2]) * weight;
-          }
-        }
-      }
-      auto *dst = resized_bgr.data() +
-                  (static_cast<std::size_t>(y) *
-                       static_cast<std::size_t>(resize_w) +
-                   static_cast<std::size_t>(x)) *
-                      3U;
-      for (int c = 0; c < 3; ++c) {
-        dst[c] = static_cast<std::uint8_t>(
-            std::clamp(std::round(values[c]), 0.0f, 255.0f));
-      }
-    }
-  }
-  write_normalized_bgr_nchw(
-      resized_bgr.data(), resize_h, resize_w,
-      static_cast<std::size_t>(resize_w) * 3U, out.nchw);
-#endif
-  return out;
-}
-
 int max_bucket(const std::vector<int> &buckets) {
   if (buckets.empty()) {
     throw std::runtime_error("recognition buckets must not be empty");
@@ -325,9 +193,13 @@ struct PendingCrop {
 
 class FullPageWorker::Impl {
 public:
-  explicit Impl(FullPageWorkerConfig config)
+  explicit Impl(FullPageWorkerConfig config,
+                std::shared_ptr<recognition::RecognitionWorker> recognizer)
       : config_(std::move(config)), detector_(config_.detector),
-        recognizer_(config_.recognizer) {
+        recognizer_(recognizer ? std::move(recognizer)
+                              : std::make_shared<recognition::RecognitionWorker>(config_.recognizer)) {
+    // The supplied worker owns recognition settings and lifetime.
+    config_.recognizer = recognizer_->config();
     if (config_.recognition_height != 48) {
       throw std::runtime_error("recognition_height must be 48 for this engine");
     }
@@ -341,10 +213,25 @@ public:
         std::unique(config_.recognition_buckets.begin(),
                     config_.recognition_buckets.end()),
         config_.recognition_buckets.end());
+    configured_recognition_buckets_ = config_.recognition_buckets;
     for (const int bucket : config_.recognition_buckets) {
       if (bucket <= 0 || bucket > config_.recognizer.max_width) {
         throw std::runtime_error("recognition bucket is outside worker limits");
       }
+    }
+    config_.recognition_buckets.erase(
+        std::remove_if(
+            config_.recognition_buckets.begin(),
+            config_.recognition_buckets.end(),
+            [this](int bucket) {
+              return !recognizer_->supports_shape(1, bucket) ||
+                     !recognizer_->supports_shape(
+                         config_.recognizer.max_batch_size, bucket);
+            }),
+        config_.recognition_buckets.end());
+    if (config_.recognition_buckets.empty()) {
+      throw std::runtime_error(
+          "recognizer engine supports none of the configured line buckets");
     }
 
     max_bucket_width_ = max_bucket(config_.recognition_buckets);
@@ -358,7 +245,18 @@ public:
     d_crop_widths_.reset(static_cast<std::size_t>(
         config_.recognizer.max_batch_size));
     d_roi_batch_.reset(roi_count);
-    PPOCRV6_CUDA_CHECK(cudaStreamCreate(&stream_));
+    const std::size_t detector_input_count =
+        3U * static_cast<std::size_t>(config_.detector.max_height) *
+        static_cast<std::size_t>(config_.detector.max_width);
+    d_detector_input_.reset(detector_input_count);
+    h_m_invs_.reset(transform_count);
+    h_crop_widths_.reset(
+        static_cast<std::size_t>(config_.recognizer.max_batch_size));
+    PPOCRV6_CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+    PPOCRV6_CUDA_CHECK(cudaEventCreate(&preprocess_start_event_));
+    PPOCRV6_CUDA_CHECK(cudaEventCreate(&preprocess_stop_event_));
+    PPOCRV6_CUDA_CHECK(cudaEventCreate(&roi_start_event_));
+    PPOCRV6_CUDA_CHECK(cudaEventCreate(&roi_stop_event_));
   }
 
   ~Impl() {
@@ -366,6 +264,18 @@ public:
       cudaStreamSynchronize(stream_);
       cudaStreamDestroy(stream_);
       stream_ = nullptr;
+    }
+    if (preprocess_start_event_ != nullptr) {
+      cudaEventDestroy(preprocess_start_event_);
+    }
+    if (preprocess_stop_event_ != nullptr) {
+      cudaEventDestroy(preprocess_stop_event_);
+    }
+    if (roi_start_event_ != nullptr) {
+      cudaEventDestroy(roi_start_event_);
+    }
+    if (roi_stop_event_ != nullptr) {
+      cudaEventDestroy(roi_stop_event_);
     }
   }
 
@@ -394,9 +304,11 @@ public:
     result.source_width = image_width;
     result.detector_height = detector_height;
     result.detector_width = detector_width;
-    return run_pipeline_locked(image, image_height, image_width, image_stride,
-                               source_color_order, detector_nchw, result,
-                               total_start);
+    auto detection_result = detector_.detect_f32(
+        detector_nchw, 1, detector_height, detector_width, true);
+    return run_pipeline_after_detection_locked(
+        image, image_height, image_width, image_stride, source_color_order,
+        std::move(detection_result), false, result, total_start);
   }
 
   FullPageResult recognize_page_image(const std::uint8_t *image,
@@ -413,32 +325,46 @@ public:
 
     std::lock_guard<std::mutex> guard(mutex_);
     const auto total_start = std::chrono::steady_clock::now();
-    const auto preprocess_start = std::chrono::steady_clock::now();
-    auto detector_input = preprocess_detector_input_opencv(
-        image, image_height, image_width, image_stride, source_color_order,
-        config_.detector_preprocess);
+    const auto [content_height, content_width] =
+        detector_resize_shape(image_height, image_width,
+                              config_.detector_preprocess);
+    const auto [detector_height, detector_width] =
+        detector_.padded_shape(content_height, content_width);
 
     FullPageResult result;
     result.source_height = image_height;
     result.source_width = image_width;
-    result.detector_height = detector_input.height;
-    result.detector_width = detector_input.width;
+    result.detector_height = detector_height;
+    result.detector_width = detector_width;
+
+    PPOCRV6_CUDA_CHECK(cudaEventRecord(preprocess_start_event_, stream_));
+    copy_source_image(image, image_height, image_width, image_stride);
+    GpuImage gpu_image{d_source_image_.get(),
+                       static_cast<std::size_t>(image_stride), image_height,
+                       image_width};
+    kernels::cuda_resize_normalize_detector_padded(
+        gpu_image, d_detector_input_.get(), detector_height, detector_width,
+        content_height, content_width,
+        source_color_order == SourceColorOrder::kBgr, stream_);
+    PPOCRV6_CUDA_CHECK(cudaEventRecord(preprocess_stop_event_, stream_));
+    auto detection_result = detector_.detect_device_f32(
+        d_detector_input_.get(), 1, detector_height, detector_width, true,
+        preprocess_stop_event_);
     result.timing.detector_preprocess_ms =
-        elapsed_ms(preprocess_start, std::chrono::steady_clock::now());
-    return run_pipeline_locked(image, image_height, image_width, image_stride,
-                               source_color_order, detector_input.nchw.data(),
-                               result, total_start);
+        elapsed_event_ms(preprocess_start_event_, preprocess_stop_event_);
+    return run_pipeline_after_detection_locked(
+        image, image_height, image_width, image_stride, source_color_order,
+        std::move(detection_result), true, result, total_start,
+        content_height, content_width);
   }
 
-  FullPageResult run_pipeline_locked(
+  FullPageResult run_pipeline_after_detection_locked(
       const std::uint8_t *image, int image_height, int image_width,
       int image_stride, SourceColorOrder source_color_order,
-      const float *detector_nchw, FullPageResult result,
-      std::chrono::steady_clock::time_point total_start) {
-
-    auto detection_result =
-        detector_.detect_f32(detector_nchw, 1, result.detector_height,
-                             result.detector_width, true);
+      detection::DetectionTensorResult detection_result,
+      bool source_already_copied, FullPageResult result,
+      std::chrono::steady_clock::time_point total_start,
+      int content_height = 0, int content_width = 0) {
     result.detector_output_height = detection_result.output_h;
     result.detector_output_width = detection_result.output_w;
     result.timing.detect_ms = detection_result.elapsed_ms;
@@ -448,6 +374,29 @@ public:
     result.timing.detector_output_bytes = detection_result.output_bytes;
 
     const auto post_start = std::chrono::steady_clock::now();
+    // Remove padded map rows/columns before contours, scoring, unclipping and
+    // source-coordinate scaling. The unpadded path remains byte-for-byte intact.
+    if (content_height > 0 && content_width > 0 &&
+        (content_height != result.detector_height ||
+         content_width != result.detector_width)) {
+      const int64_t h_product = static_cast<int64_t>(content_height) * detection_result.output_h;
+      const int64_t w_product = static_cast<int64_t>(content_width) * detection_result.output_w;
+      if (h_product % result.detector_height != 0 ||
+          w_product % result.detector_width != 0) {
+        throw std::runtime_error("detector content is not aligned to output map");
+      }
+      const int h = static_cast<int>(h_product / result.detector_height);
+      const int w = static_cast<int>(w_product / result.detector_width);
+      for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+          detection_result.output[static_cast<std::size_t>(y) * w + x] =
+              detection_result.output[static_cast<std::size_t>(y) * detection_result.output_w + x];
+        }
+      }
+      detection_result.output.resize(static_cast<std::size_t>(h) * w);
+      detection_result.output_h = h;
+      detection_result.output_w = w;
+    }
     auto boxes = detection::postprocess_db_map(
         detection_result.output.data(), detection_result.output_h,
         detection_result.output_w, image_height, image_width,
@@ -485,75 +434,62 @@ public:
       return result;
     }
 
-    copy_source_image(image, image_height, image_width, image_stride);
+    if (!source_already_copied) {
+      copy_source_image(image, image_height, image_width, image_stride);
+    }
     GpuImage gpu_image{d_source_image_.get(),
                        static_cast<std::size_t>(image_stride), image_height,
                        image_width};
 
-    std::vector<float> h_m_invs;
-    std::vector<int> h_crop_widths;
     const int max_batch = config_.recognizer.max_batch_size;
-    h_m_invs.reserve(static_cast<std::size_t>(max_batch) * 9U);
-    h_crop_widths.reserve(static_cast<std::size_t>(max_batch));
+    for (const auto &[bucket, crops] : groups) {
+      for (std::size_t start = 0; start < crops.size();
+           start += static_cast<std::size_t>(max_batch)) {
+        const int chunk_count = static_cast<int>(std::min<std::size_t>(
+            static_cast<std::size_t>(max_batch), crops.size() - start));
+        for (int row = 0; row < chunk_count; ++row) {
+          const auto &transform =
+              crops[start + static_cast<std::size_t>(row)].transform;
+          std::memcpy(h_m_invs_.get() + static_cast<std::size_t>(row) * 9U,
+                      transform.m_inv.data(), 9U * sizeof(float));
+          h_crop_widths_.get()[row] = transform.crop_width;
+        }
 
-    cudaEvent_t event_start = nullptr;
-    cudaEvent_t event_stop = nullptr;
-    PPOCRV6_CUDA_CHECK(cudaEventCreate(&event_start));
-    PPOCRV6_CUDA_CHECK(cudaEventCreate(&event_stop));
-    try {
-      for (const auto &[bucket, crops] : groups) {
-        for (std::size_t start = 0; start < crops.size();
-             start += static_cast<std::size_t>(max_batch)) {
-          const int chunk_count = static_cast<int>(std::min<std::size_t>(
-              static_cast<std::size_t>(max_batch), crops.size() - start));
-          h_m_invs.clear();
-          h_crop_widths.clear();
-          for (int row = 0; row < chunk_count; ++row) {
-            const auto &transform = crops[start + static_cast<std::size_t>(row)]
-                                        .transform;
-            h_m_invs.insert(h_m_invs.end(), transform.m_inv.begin(),
-                            transform.m_inv.end());
-            h_crop_widths.push_back(transform.crop_width);
-          }
+        PPOCRV6_CUDA_CHECK(cudaEventRecord(roi_start_event_, stream_));
+        PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(
+            d_m_invs_.get(), h_m_invs_.get(),
+            static_cast<std::size_t>(chunk_count) * 9U * sizeof(float),
+            cudaMemcpyHostToDevice, stream_));
+        PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(
+            d_crop_widths_.get(), h_crop_widths_.get(),
+            static_cast<std::size_t>(chunk_count) * sizeof(int),
+            cudaMemcpyHostToDevice, stream_));
+        kernels::cuda_batch_roi_warp(
+            gpu_image, d_m_invs_.get(), d_crop_widths_.get(),
+            d_roi_batch_.get(), chunk_count, config_.recognition_height, bucket,
+            roi_color_order(source_color_order), stream_);
+        PPOCRV6_CUDA_CHECK(cudaEventRecord(roi_stop_event_, stream_));
 
-          PPOCRV6_CUDA_CHECK(cudaEventRecord(event_start, stream_));
-          PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(
-              d_m_invs_.get(), h_m_invs.data(),
-              h_m_invs.size() * sizeof(float), cudaMemcpyHostToDevice,
-              stream_));
-          PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(
-              d_crop_widths_.get(), h_crop_widths.data(),
-              h_crop_widths.size() * sizeof(int), cudaMemcpyHostToDevice,
-              stream_));
-          kernels::cuda_batch_roi_warp(
-              gpu_image, d_m_invs_.get(), d_crop_widths_.get(),
-              d_roi_batch_.get(), chunk_count, config_.recognition_height,
-              bucket, roi_color_order(source_color_order), stream_);
-          PPOCRV6_CUDA_CHECK(cudaEventRecord(event_stop, stream_));
-          result.timing.roi_ms += elapsed_event_ms(event_start, event_stop);
-
-          auto recog_result = recognizer_.recognize_device_f32(
-              d_roi_batch_.get(), chunk_count, bucket, chunk_count, false);
-          result.timing.recognize_ms += recog_result.elapsed_ms;
-          result.timing.recognition_output_bytes += recog_result.output_bytes;
-          result.recognition_chunks.insert(result.recognition_chunks.end(),
-                                           recog_result.chunks.begin(),
-                                           recog_result.chunks.end());
-          for (int row = 0; row < chunk_count; ++row) {
-            const int line_index =
-                crops[start + static_cast<std::size_t>(row)].line_index;
-            result.lines[static_cast<std::size_t>(line_index)].prediction =
-                std::move(recog_result.predictions[static_cast<std::size_t>(row)]);
-          }
+        auto recog_result = recognizer_->recognize_device_f32_on_stream(
+            d_roi_batch_.get(), chunk_count, bucket, chunk_count, false,
+            stream_);
+        const double roi_ms =
+            elapsed_event_ms(roi_start_event_, roi_stop_event_);
+        result.timing.roi_ms += roi_ms;
+        result.timing.recognize_ms +=
+            std::max(0.0, recog_result.elapsed_ms - roi_ms);
+        result.timing.recognition_output_bytes += recog_result.output_bytes;
+        result.recognition_chunks.insert(result.recognition_chunks.end(),
+                                         recog_result.chunks.begin(),
+                                         recog_result.chunks.end());
+        for (int row = 0; row < chunk_count; ++row) {
+          const int line_index =
+              crops[start + static_cast<std::size_t>(row)].line_index;
+          result.lines[static_cast<std::size_t>(line_index)].prediction =
+              std::move(recog_result.predictions[static_cast<std::size_t>(row)]);
         }
       }
-    } catch (...) {
-      cudaEventDestroy(event_start);
-      cudaEventDestroy(event_stop);
-      throw;
     }
-    PPOCRV6_CUDA_CHECK(cudaEventDestroy(event_start));
-    PPOCRV6_CUDA_CHECK(cudaEventDestroy(event_stop));
 
     result.timing.total_ms =
         elapsed_ms(total_start, std::chrono::steady_clock::now());
@@ -564,8 +500,16 @@ public:
     std::ostringstream out;
     out << '{';
     out << "\"detector\":" << detector_.info_json();
-    out << ",\"recognizer\":" << recognizer_.info_json();
+    out << ",\"recognizer\":" << recognizer_->info_json();
     out << ",\"recognition_height\":" << config_.recognition_height;
+    out << ",\"configured_recognition_buckets\":[";
+    for (std::size_t i = 0; i < configured_recognition_buckets_.size(); ++i) {
+      if (i != 0) {
+        out << ',';
+      }
+      out << configured_recognition_buckets_[i];
+    }
+    out << ']';
     out << ",\"recognition_buckets\":[";
     for (std::size_t i = 0; i < config_.recognition_buckets.size(); ++i) {
       if (i != 0) {
@@ -591,12 +535,14 @@ public:
                         limit_type_to_string(config_.detector_preprocess.limit_type));
     out << ",\"max_side_limit\":"
         << config_.detector_preprocess.max_side_limit;
-#if defined(PPOCRV6_NATIVE_HAVE_OPENCV_POSTPROCESS)
-    out << ",\"implementation\":\"opencv\"";
-#else
-    out << ",\"implementation\":\"fallback_smoke\"";
-#endif
+    out << ",\"implementation\":\"cuda\"";
     out << '}';
+    out << ",\"db_postprocess_implementation\":";
+#if defined(PPOCRV6_NATIVE_HAVE_OPENCV_POSTPROCESS)
+    append_json_escaped(out, "opencv");
+#else
+    append_json_escaped(out, "fallback_smoke");
+#endif
     out << '}';
     return out.str();
   }
@@ -613,28 +559,40 @@ private:
         static_cast<std::size_t>(image_stride);
     if (source_capacity_bytes_ < bytes) {
       d_source_image_.reset(bytes);
+      h_source_image_.reset(bytes);
       source_capacity_bytes_ = bytes;
     }
-    PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(d_source_image_.get(), image, bytes,
+    std::memcpy(h_source_image_.get(), image, bytes);
+    PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(d_source_image_.get(),
+                                       h_source_image_.get(), bytes,
                                        cudaMemcpyHostToDevice, stream_));
-    PPOCRV6_CUDA_CHECK(cudaStreamSynchronize(stream_));
   }
 
   FullPageWorkerConfig config_;
   detection::DetectionWorker detector_;
-  recognition::RecognitionWorker recognizer_;
+  std::shared_ptr<recognition::RecognitionWorker> recognizer_;
+  std::vector<int> configured_recognition_buckets_;
   int max_bucket_width_ = 0;
   CudaPtr<std::uint8_t> d_source_image_;
+  CudaHostPtr<std::uint8_t> h_source_image_;
+  CudaPtr<float> d_detector_input_;
   CudaPtr<float> d_m_invs_;
   CudaPtr<int> d_crop_widths_;
   CudaPtr<float> d_roi_batch_;
+  CudaHostPtr<float> h_m_invs_;
+  CudaHostPtr<int> h_crop_widths_;
   std::size_t source_capacity_bytes_ = 0;
   cudaStream_t stream_ = nullptr;
+  cudaEvent_t preprocess_start_event_ = nullptr;
+  cudaEvent_t preprocess_stop_event_ = nullptr;
+  cudaEvent_t roi_start_event_ = nullptr;
+  cudaEvent_t roi_stop_event_ = nullptr;
   std::mutex mutex_;
 };
 
-FullPageWorker::FullPageWorker(FullPageWorkerConfig config)
-    : impl_(std::make_unique<Impl>(std::move(config))) {}
+FullPageWorker::FullPageWorker(FullPageWorkerConfig config,
+    std::shared_ptr<recognition::RecognitionWorker> recognizer)
+    : impl_(std::make_unique<Impl>(std::move(config), std::move(recognizer))) {}
 
 FullPageWorker::~FullPageWorker() = default;
 

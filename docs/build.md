@@ -9,7 +9,38 @@ The smoke commands below use host networking and port `8184`. On shared GPU
 hosts, check local policy and current GPU/container usage before starting
 long-lived or memory-heavy workloads.
 
-## Build Image
+## vLLM-Compatible Image
+
+The image used by `serve-orchestrator` shares the
+`docker.io/vllm/vllm-openai:v0.23.0` CUDA 13 base and uses TensorRT 10.14:
+
+```bash
+podman build \
+  -f docker/vllm-ocr.Containerfile \
+  -t localhost/ppocrv6-vllm-ocr:dev \
+  .
+```
+
+The build installs both the optimized native library and Rust server. TensorRT
+engines are runtime-version-specific, so use the TensorRT 10.14 engine bundle
+in `tmp/vllm-ocr-model` with this image.
+
+When `localhost/ppocrv6-vllm-ocr:trt10.14-native-base` already exists, use the
+incremental overlay for a faster application-only rebuild:
+
+```bash
+podman build \
+  -f docker/vllm-ocr-server-overlay.Containerfile \
+  -t localhost/ppocrv6-vllm-ocr:dev \
+  .
+```
+
+The overlay extracts only the required TensorRT development headers and links
+against the shared libraries already in the base. It deliberately avoids the
+roughly 2.9 GB `libnvinfer-dev` package, whose static libraries are unnecessary
+for this shared-library build.
+
+## Standalone TensorRT Image
 
 ```bash
 podman build \
@@ -79,6 +110,8 @@ podman run --rm --device nvidia.com/gpu=all --network host --entrypoint bash \
          --workspace-mib 1024 \
          --glyph-min-batch 1 --glyph-opt-batch 128 --glyph-max-batch 256 \
          --glyph-min-width 48 --glyph-opt-width 80 --glyph-max-width 128 \
+         --short-line-min-batch 1 --short-line-opt-batch 8 --short-line-max-batch 12 \
+         --short-line-min-width 128 --short-line-opt-width 384 --short-line-max-width 640 \
          --line-min-batch 1 --line-opt-batch 8 --line-max-batch 12 \
          --line-min-width 640 --line-opt-width 1600 --line-max-width 3200'
 ```
@@ -133,10 +166,22 @@ curl -s http://127.0.0.1:8184/v1/ocr/info | python3 -m json.tool
 
 ## Glyph Benchmark
 
+Use representative PNG or JPEG inputs for production throughput measurements.
+The benchmark's generated PPM fallback is convenient for a dependency-free
+smoke run, but its base64/JSON size and decode path are not production-like.
+The default API accepts up to 1,024 images per logical request and executes
+them in TensorRT chunks of up to 256 images. Compare TensorRT batch size
+independently from HTTP request concurrency.
+
 ```bash
+magick examples/samples/glyph_A.ppm /tmp/glyph_A.png
+
 python3 tools/bench_glyph_http.py \
   --url http://127.0.0.1:8184/v1/glyphs/recognize \
+  --image /tmp/glyph_A.png \
+  --unique-image-payloads \
   --counts 1,6,16,32,64 \
   --width 80 \
-  --batch-size 64
+  --batch-size 256 \
+  --character-policy all
 ```

@@ -4,7 +4,8 @@
 The script sends single or batched base64 image payloads to
 `/v1/glyphs/recognize` and reports latency/throughput. If no image directory is
 provided, it uses a generated 48x48 PPM image. That synthetic image is useful
-for throughput only, not accuracy.
+for a dependency-free smoke/microbenchmark only. Use representative PNG or
+JPEG inputs for production throughput measurements.
 """
 
 from __future__ import annotations
@@ -117,12 +118,21 @@ def find_png_iend_offset(raw: bytes) -> int:
     raise SystemExit("PNG input is missing an IEND chunk")
 
 
-def make_image_payload(images: list[str], count: int, width: int, batch_size: int) -> dict[str, Any]:
+def make_image_payload(
+    images: list[str],
+    count: int,
+    width: int,
+    batch_size: int,
+    character_policy: str,
+    score_mode: str,
+) -> dict[str, Any]:
     selected = [images[i % len(images)] for i in range(count)]
     return {
         "images": selected,
         "width": width,
         "batch_size": batch_size,
+        "character_policy": character_policy,
+        "score_mode": score_mode,
     }
 
 
@@ -152,11 +162,15 @@ def run_case(
     count: int,
     width: int,
     batch_size: int,
+    character_policy: str,
+    score_mode: str,
     warmups: int,
     repeats: int,
     timeout: float,
 ) -> dict[str, Any]:
-    payload = make_image_payload(images, count, width, batch_size)
+    payload = make_image_payload(
+        images, count, width, batch_size, character_policy, score_mode
+    )
     for _ in range(warmups):
         post_json(url, payload, timeout)
 
@@ -216,7 +230,18 @@ def main() -> None:
     )
     parser.add_argument("--counts", type=parse_csv_ints, default=parse_csv_ints("1,6,16,32,64"))
     parser.add_argument("--width", type=int, default=80)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument(
+        "--character-policy",
+        choices=["cjk_focus", "cjk_focus_fallback", "suppress_ascii", "all"],
+        default="cjk_focus_fallback",
+    )
+    parser.add_argument(
+        "--score-mode",
+        choices=["accepted", "model"],
+        default="accepted",
+        help="Use binary accepted scores (default) or calculate model probabilities.",
+    )
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument("--timeout", type=float, default=30.0)
@@ -254,6 +279,8 @@ def main() -> None:
             count=count,
             width=args.width,
             batch_size=args.batch_size,
+            character_policy=args.character_policy,
+            score_mode=args.score_mode,
             warmups=args.warmups,
             repeats=args.repeats,
             timeout=args.timeout,

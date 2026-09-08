@@ -1,8 +1,11 @@
 #pragma once
 
+#include <cuda_runtime_api.h>
+
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ppocrv6_native::detection {
@@ -44,8 +47,14 @@ public:
 
   DetectionTensorResult detect_f32(const float *nchw, int batch, int height,
                                    int width, bool copy_output);
+  DetectionTensorResult detect_device_f32(const float *device_nchw, int batch,
+                                          int height, int width,
+                                          bool copy_output,
+                                          cudaEvent_t input_ready = nullptr);
 
   [[nodiscard]] std::string info_json() const;
+  // Smallest supported, 32-aligned canvas containing the resized image.
+  [[nodiscard]] std::pair<int, int> padded_shape(int height, int width) const;
   [[nodiscard]] const DetectionWorkerConfig &config() const noexcept;
 
 private:

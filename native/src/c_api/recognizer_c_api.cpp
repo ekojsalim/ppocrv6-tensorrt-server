@@ -5,12 +5,11 @@
 
 #include <cstdlib>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
-struct ppocrv6_recognizer {
-  std::unique_ptr<ppocrv6_native::recognition::RecognitionWorker> worker;
-};
+#include "recognizer_handle.h"
 
 namespace {
 
@@ -49,6 +48,33 @@ ppocrv6_native::recognition::RecognitionWorkerConfig parse_config(
   return config;
 }
 
+ppocrv6_native::recognition::CharacterPolicy parse_character_policy(
+    int character_policy) {
+  switch (character_policy) {
+  case PPOCRV6_CHARACTER_POLICY_ALL:
+    return ppocrv6_native::recognition::CharacterPolicy::kAll;
+  case PPOCRV6_CHARACTER_POLICY_SUPPRESS_ASCII:
+    return ppocrv6_native::recognition::CharacterPolicy::kSuppressAscii;
+  case PPOCRV6_CHARACTER_POLICY_CJK_FOCUS:
+    return ppocrv6_native::recognition::CharacterPolicy::kCjkFocus;
+  case PPOCRV6_CHARACTER_POLICY_CJK_FOCUS_FALLBACK:
+    return ppocrv6_native::recognition::CharacterPolicy::kCjkFocusFallback;
+  default:
+    throw std::invalid_argument("unsupported character policy");
+  }
+}
+
+ppocrv6_native::recognition::ScoreMode parse_score_mode(int score_mode) {
+  switch (score_mode) {
+  case PPOCRV6_SCORE_MODE_MODEL:
+    return ppocrv6_native::recognition::ScoreMode::kModel;
+  case PPOCRV6_SCORE_MODE_ACCEPTED:
+    return ppocrv6_native::recognition::ScoreMode::kAccepted;
+  default:
+    throw std::invalid_argument("unsupported score mode");
+  }
+}
+
 } // namespace
 
 extern "C" int ppocrv6_recognizer_create(const char *config_json,
@@ -63,7 +89,7 @@ extern "C" int ppocrv6_recognizer_create(const char *config_json,
     auto config = parse_config(config_json);
     auto handle = std::make_unique<ppocrv6_recognizer>();
     handle->worker =
-        std::make_unique<ppocrv6_native::recognition::RecognitionWorker>(
+        std::make_shared<ppocrv6_native::recognition::RecognitionWorker>(
             std::move(config));
     *out_handle = handle.release();
   });
@@ -100,6 +126,47 @@ extern "C" int ppocrv6_recognizer_recognize_f32(
   });
 }
 
+extern "C" int ppocrv6_recognizer_recognize_f32_with_options(
+    ppocrv6_recognizer *handle, const float *nchw, int count, int width,
+    int batch_size, int return_timesteps, int character_policy,
+    char **out_json, char **out_error) {
+  if (handle == nullptr || handle->worker == nullptr) {
+    set_error(out_error, "recognizer handle is null");
+    return 1;
+  }
+  return ffi_guard(out_error, [&]() {
+    const bool include_timesteps = return_timesteps != 0;
+    auto result = handle->worker->recognize_f32(
+        nchw, count, width, batch_size, include_timesteps,
+        parse_character_policy(character_policy));
+    set_output(out_json, ppocrv6_native::recognition::recognition_result_to_json(
+                              result, include_timesteps));
+  });
+}
+
+extern "C" int ppocrv6_recognizer_recognize_f32_with_options_v2(
+    ppocrv6_recognizer *handle, const float *nchw, int count, int width,
+    int batch_size, int return_timesteps, int character_policy, int score_mode,
+    char **out_json, char **out_error) {
+  if (handle == nullptr || handle->worker == nullptr) {
+    set_error(out_error, "recognizer handle is null");
+    return 1;
+  }
+  return ffi_guard(out_error, [&]() {
+    const bool include_timesteps = return_timesteps != 0;
+    auto result = handle->worker->recognize_f32(
+        nchw, count, width, batch_size, include_timesteps,
+        parse_character_policy(character_policy), parse_score_mode(score_mode));
+    set_output(out_json, ppocrv6_native::recognition::recognition_result_to_json(
+                              result, include_timesteps));
+  });
+}
+
 extern "C" void ppocrv6_recognizer_free_string(char *value) {
   std::free(value);
+}
+
+extern "C" int ppocrv6_recognizer_supports_shape(ppocrv6_recognizer *handle,
+                                                int batch, int width) {
+  return handle && handle->worker && handle->worker->supports_shape(batch, width);
 }
