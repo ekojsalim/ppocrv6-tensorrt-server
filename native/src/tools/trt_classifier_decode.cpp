@@ -361,6 +361,14 @@ int main(int argc, char **argv) {
   PPOCRV6_CUDA_CHECK(cudaStreamDestroy(stream));
 
   const auto indices_out = args.find("--out-indices");
+  const auto hidden_out = args.find("--out-hidden");
+  if (hidden_out != args.end()) {
+    std::vector<std::uint16_t> hidden(hidden_count);
+    PPOCRV6_CUDA_CHECK(cudaMemcpy(hidden.data(), d_hidden.get(),
+                                  hidden.size() * sizeof(std::uint16_t),
+                                  cudaMemcpyDeviceToHost));
+    write_binary(hidden_out->second, hidden);
+  }
   if (indices_out != args.end()) {
     write_binary(indices_out->second, indices);
   }

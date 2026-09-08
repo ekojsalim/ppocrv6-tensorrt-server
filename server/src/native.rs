@@ -9,6 +9,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 type CreateFn = unsafe extern "C" fn(*const c_char, *mut *mut c_void, *mut *mut c_char) -> c_int;
+type SupportsShapeFn = unsafe extern "C" fn(*mut c_void, c_int, c_int) -> c_int;
 type DestroyFn = unsafe extern "C" fn(*mut c_void);
 type InfoFn = unsafe extern "C" fn(*mut c_void, *mut *mut c_char, *mut *mut c_char) -> c_int;
 type RecognizeF32WithOptionsV2Fn = unsafe extern "C" fn(
@@ -25,7 +26,7 @@ type RecognizeF32WithOptionsV2Fn = unsafe extern "C" fn(
 ) -> c_int;
 type FreeStringFn = unsafe extern "C" fn(*mut c_char);
 type FullPageCreateFn =
-    unsafe extern "C" fn(*const c_char, *mut *mut c_void, *mut *mut c_char) -> c_int;
+    unsafe extern "C" fn(*const c_char, *mut c_void, *mut *mut c_void, *mut *mut c_char) -> c_int;
 type FullPageDestroyFn = unsafe extern "C" fn(*mut c_void);
 type FullPageInfoFn =
     unsafe extern "C" fn(*mut c_void, *mut *mut c_char, *mut *mut c_char) -> c_int;
@@ -63,6 +64,7 @@ pub struct NativeRecognizer {
     destroy: DestroyFn,
     info_json_fn: InfoFn,
     recognize_f32_with_options_v2_fn: RecognizeF32WithOptionsV2Fn,
+    supports_shape_fn: SupportsShapeFn,
     free_string: FreeStringFn,
 }
 
@@ -115,6 +117,9 @@ pub struct NativeFullPage {
 unsafe impl Send for NativeFullPage {}
 
 impl NativeRecognizer {
+    pub fn supports_shape(&self, batch: i32, width: i32) -> bool {
+        unsafe { (self.supports_shape_fn)(self.handle, batch, width) != 0 }
+    }
     pub fn load(library_path: &Path, config: &NativeConfig<'_>) -> Result<Self> {
         let config_json = serde_json::to_string(config)?;
         let config_c = CString::new(config_json).context("native config contains NUL byte")?;
@@ -122,6 +127,8 @@ impl NativeRecognizer {
         let library = unsafe { Library::new(library_path) }
             .with_context(|| format!("failed to load native library {}", library_path.display()))?;
         let create: CreateFn = unsafe { *library.get(b"ppocrv6_recognizer_create\0")? };
+        let supports_shape_fn: SupportsShapeFn =
+            unsafe { *library.get(b"ppocrv6_recognizer_supports_shape\0")? };
         let destroy: DestroyFn = unsafe { *library.get(b"ppocrv6_recognizer_destroy\0")? };
         let info_json_fn: InfoFn = unsafe { *library.get(b"ppocrv6_recognizer_info_json\0")? };
         let recognize_f32_with_options_v2_fn: RecognizeF32WithOptionsV2Fn =
@@ -144,6 +151,7 @@ impl NativeRecognizer {
             destroy,
             info_json_fn,
             recognize_f32_with_options_v2_fn,
+            supports_shape_fn,
             free_string,
         })
     }
@@ -209,14 +217,19 @@ impl Drop for NativeRecognizer {
 }
 
 impl NativeFullPage {
-    pub fn load(library_path: &Path, config: &FullPageNativeConfig<'_>) -> Result<Self> {
+    pub fn load(
+        library_path: &Path,
+        config: &FullPageNativeConfig<'_>,
+        recognizer: &NativeRecognizer,
+    ) -> Result<Self> {
         let config_json = serde_json::to_string(config)?;
         let config_c =
             CString::new(config_json).context("native full-page config contains NUL byte")?;
 
         let library = unsafe { Library::new(library_path) }
             .with_context(|| format!("failed to load native library {}", library_path.display()))?;
-        let create: FullPageCreateFn = unsafe { *library.get(b"ppocrv6_full_page_create\0")? };
+        let create: FullPageCreateFn =
+            unsafe { *library.get(b"ppocrv6_full_page_create_with_recognizer\0")? };
         let destroy: FullPageDestroyFn = unsafe { *library.get(b"ppocrv6_full_page_destroy\0")? };
         let info_json_fn: FullPageInfoFn =
             unsafe { *library.get(b"ppocrv6_full_page_info_json\0")? };
@@ -227,7 +240,14 @@ impl NativeFullPage {
 
         let mut handle = ptr::null_mut();
         let mut error = ptr::null_mut();
-        let code = unsafe { create(config_c.as_ptr(), &mut handle, &mut error) };
+        let code = unsafe {
+            create(
+                config_c.as_ptr(),
+                recognizer.handle,
+                &mut handle,
+                &mut error,
+            )
+        };
         if code != 0 || handle.is_null() {
             let message = unsafe { take_native_string(error, free_string) }
                 .unwrap_or_else(|| "native full-page create failed".to_string());

@@ -2,6 +2,7 @@
 
 #include "ppocrv6_native/common/cuda_check.h"
 #include "ppocrv6_native/common/cuda_ptr.h"
+#include "ppocrv6_native/common/trt_workspace.h"
 #include "ppocrv6_native/engine/trt_engine.h"
 
 #include <NvInfer.h>
@@ -225,6 +226,32 @@ void append_float(std::ostringstream &out, double value) {
 
 class DetectionWorker::Impl {
 public:
+  std::pair<int, int> padded_shape(int height, int width) const {
+    if (height <= 0 || width <= 0) {
+      throw std::invalid_argument("invalid detector content shape");
+    }
+    std::pair<int, int> best{0, 0};
+    for (int p = 0; p < engine_->getNbOptimizationProfiles(); ++p) {
+      const auto lo = engine_->getProfileShape(input_name_.c_str(), p,
+                                               nvinfer1::OptProfileSelector::kMIN);
+      const auto hi = engine_->getProfileShape(input_name_.c_str(), p,
+                                               nvinfer1::OptProfileSelector::kMAX);
+      if (lo.nbDims != 4 || hi.nbDims != 4) continue;
+      const int h = ((std::max(height, static_cast<int>(lo.d[2])) + 31) / 32) * 32;
+      const int w = ((std::max(width, static_cast<int>(lo.d[3])) + 31) / 32) * 32;
+      if (h > config_.max_height || w > config_.max_width ||
+          !dims_contains(lo, hi, nvinfer1::Dims4{1, 3, h, w})) continue;
+      if (best.first == 0 || static_cast<int64_t>(h) * w <
+                                 static_cast<int64_t>(best.first) * best.second) {
+        best = {h, w};
+      }
+    }
+    if (best.first == 0) {
+      throw std::runtime_error("no TensorRT detector profile can contain resized image");
+    }
+    return best;
+  }
+
   explicit Impl(DetectionWorkerConfig config) : config_(std::move(config)) {
     if (config_.default_batch <= 0 || config_.default_height <= 0 ||
         config_.default_width <= 0 || config_.max_batch <= 0 ||
@@ -271,11 +298,7 @@ public:
     }
     context_memory_bytes_ =
         static_cast<std::size_t>(std::max<int64_t>(0, engine_->getDeviceMemorySizeV2()));
-    context_memory_.reset(context_memory_bytes_);
-    if (context_memory_bytes_ > 0) {
-      context_->setDeviceMemoryV2(
-          context_memory_.get(), static_cast<int64_t>(context_memory_bytes_));
-    }
+    workspace_ = acquire_trt_workspace(context_memory_bytes_);
 
     PPOCRV6_CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
     PPOCRV6_CUDA_CHECK(cudaEventCreate(&event_start_));
@@ -372,6 +395,8 @@ public:
         << config_.max_height << ',' << config_.max_width << ']';
     out << ",\"profiles\":" << engine_->getNbOptimizationProfiles();
     out << ",\"context_memory_bytes\":" << context_memory_bytes_;
+    out << ",\"workspace_shared\":" << (shared_trt_workspace_enabled() ? "true" : "false");
+    out << ",\"workspace_reserved_bytes\":" << workspace_->size();
     out << ",\"context_memory_mib\":";
     append_float(out, static_cast<double>(context_memory_bytes_) /
                           (1024.0 * 1024.0));
@@ -391,7 +416,7 @@ private:
     max_output_count_ = static_cast<std::size_t>(config_.max_batch) *
                         static_cast<std::size_t>(config_.max_height) *
                         static_cast<std::size_t>(config_.max_width);
-    device_input_.reset(max_input_count_);
+
     device_output_.reset(max_output_count_);
     host_output_.reset(max_output_count_);
   }
@@ -414,6 +439,8 @@ private:
   void run_once(const float *nchw, bool input_is_device, int batch, int height,
                 int width, bool copy_output, cudaEvent_t input_ready,
                 DetectionTensorResult &result) {
+    TrtWorkspace::Lease lease(*workspace_, stream_);
+    context_->setDeviceMemoryV2(lease.data(), static_cast<int64_t>(lease.size()));
     const std::size_t input_count = static_cast<std::size_t>(batch) * 3U *
                                     static_cast<std::size_t>(height) *
                                     static_cast<std::size_t>(width);
@@ -454,6 +481,7 @@ private:
     PPOCRV6_CUDA_CHECK(cudaEventRecord(event_start_, stream_));
     const float *device_input = nchw;
     if (!input_is_device) {
+      if (!device_input_) device_input_.reset(max_input_count_);
       PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(
           device_input_.get(), nchw, input_count * sizeof(float),
           cudaMemcpyHostToDevice, stream_));
@@ -507,7 +535,7 @@ private:
   nvinfer1::DataType input_dtype_ = nvinfer1::DataType::kFLOAT;
   nvinfer1::DataType output_dtype_ = nvinfer1::DataType::kFLOAT;
   std::size_t context_memory_bytes_ = 0;
-  CudaPtr<unsigned char> context_memory_;
+  std::shared_ptr<TrtWorkspace> workspace_;
   CudaPtr<float> device_input_;
   CudaPtr<float> device_output_;
   CudaHostPtr<float> host_output_;
@@ -541,6 +569,10 @@ DetectionTensorResult DetectionWorker::detect_device_f32(
 }
 
 std::string DetectionWorker::info_json() const { return impl_->info_json(); }
+
+std::pair<int, int> DetectionWorker::padded_shape(int height, int width) const {
+  return impl_->padded_shape(height, width);
+}
 
 const DetectionWorkerConfig &DetectionWorker::config() const noexcept {
   return impl_->config();

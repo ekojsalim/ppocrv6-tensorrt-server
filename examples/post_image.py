@@ -14,7 +14,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8184")
     parser.add_argument("--image", type=Path, required=True)
-    parser.add_argument("--kind", choices=["glyph", "ocr"], required=True)
+    parser.add_argument("--kind", choices=["glyph", "ocr", "line"], required=True)
     parser.add_argument("--width", type=int, default=80)
     parser.add_argument(
         "--character-policy",
@@ -41,7 +41,8 @@ def main() -> int:
         if args.score_mode is not None:
             payload["score_mode"] = args.score_mode
     else:
-        url = f"{args.base_url}/v1/ocr/recognize"
+        route = "lines" if args.kind == "line" else "ocr"
+        url = f"{args.base_url}/v1/{route}/recognize"
         payload = {"image": encoded}
 
     request = urllib.request.Request(
@@ -56,7 +57,7 @@ def main() -> int:
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
 
-    if args.kind == "glyph":
+    if args.kind in {"glyph", "line"}:
         prediction = result.get("prediction") or (result.get("predictions") or [{}])[0]
         print(json.dumps(prediction, ensure_ascii=False))
     else:

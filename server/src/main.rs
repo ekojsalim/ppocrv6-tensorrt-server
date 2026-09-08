@@ -1,3 +1,4 @@
+mod lines;
 mod native;
 
 use std::collections::HashMap;
@@ -27,6 +28,23 @@ use tokio::time::timeout;
 #[derive(Debug, Parser)]
 #[command(about = "Native PP-OCRv6 TensorRT HTTP server")]
 struct Args {
+    /// Enable cropped-line recognition without loading the detector. Full OCR also enables lines.
+    #[arg(long, env = "PPOCRV6_ENABLE_LINES")]
+    enable_lines: bool,
+
+    #[arg(long, env = "PPOCRV6_LINES_MAX_IMAGES", default_value_t = 128)]
+    lines_max_images: usize,
+
+    #[arg(long, env = "PPOCRV6_LINES_MAX_TOTAL_BYTES", default_value_t = 16 * 1024 * 1024)]
+    lines_max_total_bytes: usize,
+
+    #[arg(
+        long,
+        env = "PPOCRV6_LINES_MAX_TOTAL_PIXELS",
+        default_value_t = 16_000_000
+    )]
+    lines_max_total_pixels: u64,
+
     #[arg(
         long,
         env = "PPOCRV6_NATIVE_LIB",
@@ -216,6 +234,7 @@ struct Args {
 struct AppState {
     recognizer: Arc<Mutex<NativeRecognizer>>,
     ocr: Option<Arc<Mutex<NativeFullPage>>>,
+    lines: Option<Arc<lines::LineWorker>>,
     semaphore: Arc<Semaphore>,
     limits: Limits,
     ocr_limits: OcrLimits,
@@ -392,6 +411,29 @@ async fn main() -> anyhow::Result<()> {
     };
     let recognizer = NativeRecognizer::load(&args.native_lib, &native_config)?;
     validate_limit_type_config(&args.ocr_det_limit_type)?;
+    let line_worker = if args.enable_lines || args.enable_ocr {
+        let line_config = NativeConfig {
+            engine_path: &args.ocr_rec_engine,
+            default_width: args.ocr_rec_default_width,
+            default_batch_size: args.ocr_rec_batch_size,
+            max_batch_size: args.ocr_rec_max_batch_size,
+            max_width: args.ocr_rec_max_width,
+            warmup_runs: args.ocr_rec_warmup_runs,
+            ..native_config
+        };
+        Some(lines::LineWorker::new(
+            NativeRecognizer::load(&args.native_lib, &line_config)?,
+            &args.ocr_rec_buckets,
+            args.ocr_rec_max_batch_size,
+            args.ocr_rec_max_width,
+            args.lines_max_images,
+            args.lines_max_total_bytes,
+            args.lines_max_total_pixels,
+        )?)
+    } else {
+        None
+    };
+
     let ocr = if args.enable_ocr {
         let full_page_config = FullPageNativeConfig {
             detector_engine_path: &args.ocr_det_engine,
@@ -429,12 +471,19 @@ async fn main() -> anyhow::Result<()> {
         Some(Arc::new(Mutex::new(NativeFullPage::load(
             &args.native_lib,
             &full_page_config,
+            &line_worker
+                .as_ref()
+                .expect("line worker initialized")
+                .recognizer
+                .lock()
+                .unwrap(),
         )?)))
     } else {
         None
     };
     let state = AppState {
         recognizer: Arc::new(Mutex::new(recognizer)),
+        lines: line_worker.map(Arc::new),
         ocr,
         semaphore: Arc::new(Semaphore::new(args.worker_permits)),
         limits: Limits {
@@ -471,11 +520,28 @@ async fn main() -> anyhow::Result<()> {
         args.max_request_bytes
     };
 
+    let request_body_limit = if args.enable_lines || args.enable_ocr {
+        request_body_limit.max(
+            args.lines_max_total_bytes
+                .saturating_mul(4)
+                .saturating_div(3)
+                .saturating_add(args.lines_max_images.saturating_mul(256))
+                .saturating_add(4096),
+        )
+    } else {
+        request_body_limit
+    };
+
     let app = Router::new()
         .route("/health", get(health).options(options_ok))
         .route("/healthz", get(health).options(options_ok))
         .route("/v1/glyphs/info", get(info).options(options_ok))
         .route("/v1/glyphs/recognize", post(recognize).options(options_ok))
+        .route("/v1/lines/info", get(lines::info).options(options_ok))
+        .route(
+            "/v1/lines/recognize",
+            post(lines::recognize).options(options_ok),
+        )
         .route("/v1/ocr/info", get(ocr_info).options(options_ok))
         .route("/v1/ocr/recognize", post(ocr_recognize).options(options_ok))
         .route(
@@ -488,8 +554,15 @@ async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!(
-        "{{\"event\":\"startup\",\"listening\":\"http://{}\",\"glyph_recognize\":\"http://{}/v1/glyphs/recognize\",\"ocr_enabled\":{},\"ocr_recognize\":\"http://{}/v1/ocr/recognize\"}}",
-        addr, addr, args.enable_ocr, addr
+        "{}",
+        json!({
+            "event": "startup", "listening": format!("http://{addr}"),
+            "glyph_recognize": format!("http://{addr}/v1/glyphs/recognize"),
+            "ocr_enabled": args.enable_ocr,
+            "ocr_recognize": format!("http://{addr}/v1/ocr/recognize"),
+            "lines_enabled": args.enable_lines || args.enable_ocr,
+            "lines_recognize": format!("http://{addr}/v1/lines/recognize"),
+        })
     );
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

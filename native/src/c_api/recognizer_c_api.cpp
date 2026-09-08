@@ -9,9 +9,7 @@
 #include <string>
 #include <utility>
 
-struct ppocrv6_recognizer {
-  std::unique_ptr<ppocrv6_native::recognition::RecognitionWorker> worker;
-};
+#include "recognizer_handle.h"
 
 namespace {
 
@@ -91,7 +89,7 @@ extern "C" int ppocrv6_recognizer_create(const char *config_json,
     auto config = parse_config(config_json);
     auto handle = std::make_unique<ppocrv6_recognizer>();
     handle->worker =
-        std::make_unique<ppocrv6_native::recognition::RecognitionWorker>(
+        std::make_shared<ppocrv6_native::recognition::RecognitionWorker>(
             std::move(config));
     *out_handle = handle.release();
   });
@@ -166,4 +164,9 @@ extern "C" int ppocrv6_recognizer_recognize_f32_with_options_v2(
 
 extern "C" void ppocrv6_recognizer_free_string(char *value) {
   std::free(value);
+}
+
+extern "C" int ppocrv6_recognizer_supports_shape(ppocrv6_recognizer *handle,
+                                                int batch, int width) {
+  return handle && handle->worker && handle->worker->supports_shape(batch, width);
 }

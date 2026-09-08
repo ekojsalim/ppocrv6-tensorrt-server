@@ -193,9 +193,13 @@ struct PendingCrop {
 
 class FullPageWorker::Impl {
 public:
-  explicit Impl(FullPageWorkerConfig config)
+  explicit Impl(FullPageWorkerConfig config,
+                std::shared_ptr<recognition::RecognitionWorker> recognizer)
       : config_(std::move(config)), detector_(config_.detector),
-        recognizer_(config_.recognizer) {
+        recognizer_(recognizer ? std::move(recognizer)
+                              : std::make_shared<recognition::RecognitionWorker>(config_.recognizer)) {
+    // The supplied worker owns recognition settings and lifetime.
+    config_.recognizer = recognizer_->config();
     if (config_.recognition_height != 48) {
       throw std::runtime_error("recognition_height must be 48 for this engine");
     }
@@ -220,8 +224,8 @@ public:
             config_.recognition_buckets.begin(),
             config_.recognition_buckets.end(),
             [this](int bucket) {
-              return !recognizer_.supports_shape(1, bucket) ||
-                     !recognizer_.supports_shape(
+              return !recognizer_->supports_shape(1, bucket) ||
+                     !recognizer_->supports_shape(
                          config_.recognizer.max_batch_size, bucket);
             }),
         config_.recognition_buckets.end());
@@ -321,9 +325,11 @@ public:
 
     std::lock_guard<std::mutex> guard(mutex_);
     const auto total_start = std::chrono::steady_clock::now();
-    const auto [detector_height, detector_width] =
+    const auto [content_height, content_width] =
         detector_resize_shape(image_height, image_width,
                               config_.detector_preprocess);
+    const auto [detector_height, detector_width] =
+        detector_.padded_shape(content_height, content_width);
 
     FullPageResult result;
     result.source_height = image_height;
@@ -336,8 +342,9 @@ public:
     GpuImage gpu_image{d_source_image_.get(),
                        static_cast<std::size_t>(image_stride), image_height,
                        image_width};
-    kernels::cuda_resize_normalize_detector(
+    kernels::cuda_resize_normalize_detector_padded(
         gpu_image, d_detector_input_.get(), detector_height, detector_width,
+        content_height, content_width,
         source_color_order == SourceColorOrder::kBgr, stream_);
     PPOCRV6_CUDA_CHECK(cudaEventRecord(preprocess_stop_event_, stream_));
     auto detection_result = detector_.detect_device_f32(
@@ -347,7 +354,8 @@ public:
         elapsed_event_ms(preprocess_start_event_, preprocess_stop_event_);
     return run_pipeline_after_detection_locked(
         image, image_height, image_width, image_stride, source_color_order,
-        std::move(detection_result), true, result, total_start);
+        std::move(detection_result), true, result, total_start,
+        content_height, content_width);
   }
 
   FullPageResult run_pipeline_after_detection_locked(
@@ -355,7 +363,8 @@ public:
       int image_stride, SourceColorOrder source_color_order,
       detection::DetectionTensorResult detection_result,
       bool source_already_copied, FullPageResult result,
-      std::chrono::steady_clock::time_point total_start) {
+      std::chrono::steady_clock::time_point total_start,
+      int content_height = 0, int content_width = 0) {
     result.detector_output_height = detection_result.output_h;
     result.detector_output_width = detection_result.output_w;
     result.timing.detect_ms = detection_result.elapsed_ms;
@@ -365,6 +374,29 @@ public:
     result.timing.detector_output_bytes = detection_result.output_bytes;
 
     const auto post_start = std::chrono::steady_clock::now();
+    // Remove padded map rows/columns before contours, scoring, unclipping and
+    // source-coordinate scaling. The unpadded path remains byte-for-byte intact.
+    if (content_height > 0 && content_width > 0 &&
+        (content_height != result.detector_height ||
+         content_width != result.detector_width)) {
+      const int64_t h_product = static_cast<int64_t>(content_height) * detection_result.output_h;
+      const int64_t w_product = static_cast<int64_t>(content_width) * detection_result.output_w;
+      if (h_product % result.detector_height != 0 ||
+          w_product % result.detector_width != 0) {
+        throw std::runtime_error("detector content is not aligned to output map");
+      }
+      const int h = static_cast<int>(h_product / result.detector_height);
+      const int w = static_cast<int>(w_product / result.detector_width);
+      for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+          detection_result.output[static_cast<std::size_t>(y) * w + x] =
+              detection_result.output[static_cast<std::size_t>(y) * detection_result.output_w + x];
+        }
+      }
+      detection_result.output.resize(static_cast<std::size_t>(h) * w);
+      detection_result.output_h = h;
+      detection_result.output_w = w;
+    }
     auto boxes = detection::postprocess_db_map(
         detection_result.output.data(), detection_result.output_h,
         detection_result.output_w, image_height, image_width,
@@ -438,7 +470,7 @@ public:
             roi_color_order(source_color_order), stream_);
         PPOCRV6_CUDA_CHECK(cudaEventRecord(roi_stop_event_, stream_));
 
-        auto recog_result = recognizer_.recognize_device_f32_on_stream(
+        auto recog_result = recognizer_->recognize_device_f32_on_stream(
             d_roi_batch_.get(), chunk_count, bucket, chunk_count, false,
             stream_);
         const double roi_ms =
@@ -468,7 +500,7 @@ public:
     std::ostringstream out;
     out << '{';
     out << "\"detector\":" << detector_.info_json();
-    out << ",\"recognizer\":" << recognizer_.info_json();
+    out << ",\"recognizer\":" << recognizer_->info_json();
     out << ",\"recognition_height\":" << config_.recognition_height;
     out << ",\"configured_recognition_buckets\":[";
     for (std::size_t i = 0; i < configured_recognition_buckets_.size(); ++i) {
@@ -538,7 +570,7 @@ private:
 
   FullPageWorkerConfig config_;
   detection::DetectionWorker detector_;
-  recognition::RecognitionWorker recognizer_;
+  std::shared_ptr<recognition::RecognitionWorker> recognizer_;
   std::vector<int> configured_recognition_buckets_;
   int max_bucket_width_ = 0;
   CudaPtr<std::uint8_t> d_source_image_;
@@ -558,8 +590,9 @@ private:
   std::mutex mutex_;
 };
 
-FullPageWorker::FullPageWorker(FullPageWorkerConfig config)
-    : impl_(std::make_unique<Impl>(std::move(config))) {}
+FullPageWorker::FullPageWorker(FullPageWorkerConfig config,
+    std::shared_ptr<recognition::RecognitionWorker> recognizer)
+    : impl_(std::make_unique<Impl>(std::move(config), std::move(recognizer))) {}
 
 FullPageWorker::~FullPageWorker() = default;
 

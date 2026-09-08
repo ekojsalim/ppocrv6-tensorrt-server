@@ -85,7 +85,8 @@ struct FullPageResult {
 
 class FullPageWorker {
 public:
-  explicit FullPageWorker(FullPageWorkerConfig config);
+  explicit FullPageWorker(FullPageWorkerConfig config,
+      std::shared_ptr<recognition::RecognitionWorker> recognizer = nullptr);
   ~FullPageWorker();
 
   FullPageWorker(const FullPageWorker &) = delete;

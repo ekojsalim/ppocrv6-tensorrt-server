@@ -10,6 +10,8 @@ int ppocrv6_recognizer_create(const char *config_json,
                               ppocrv6_recognizer **out_handle,
                               char **out_error);
 
+int ppocrv6_recognizer_supports_shape(ppocrv6_recognizer *handle, int batch, int width);
+
 void ppocrv6_recognizer_destroy(ppocrv6_recognizer *handle);
 
 int ppocrv6_recognizer_info_json(ppocrv6_recognizer *handle, char **out_json,

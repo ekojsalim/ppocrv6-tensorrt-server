@@ -34,7 +34,7 @@ __device__ float bilinear_channel(const unsigned char *src, int src_h,
 
 __global__ void resize_normalize_detector_kernel(
     const unsigned char *__restrict__ src, int src_h, int src_w, int src_step,
-    float *__restrict__ dst, int dst_h, int dst_w, int source_is_bgr) {
+    float *__restrict__ dst, int dst_h, int dst_w, int content_h, int content_w, int source_is_bgr) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
   const int y = blockIdx.y * blockDim.y + threadIdx.y;
   if (x >= dst_w || y >= dst_h) {
@@ -42,20 +42,20 @@ __global__ void resize_normalize_detector_kernel(
   }
 
   const float scale_x =
-      static_cast<float>(src_w) / static_cast<float>(dst_w);
+      static_cast<float>(src_w) / static_cast<float>(content_w);
   const float scale_y =
-      static_cast<float>(src_h) / static_cast<float>(dst_h);
+      static_cast<float>(src_h) / static_cast<float>(content_h);
   const float src_x = (static_cast<float>(x) + 0.5f) * scale_x - 0.5f;
   const float src_y = (static_cast<float>(y) + 0.5f) * scale_y - 0.5f;
 
   const int b_channel = source_is_bgr != 0 ? 0 : 2;
   const int g_channel = 1;
   const int r_channel = source_is_bgr != 0 ? 2 : 0;
-  const float b = bilinear_channel(src, src_h, src_w, src_step, src_x, src_y,
+  const float b = (x >= content_w || y >= content_h) ? 255.0f : bilinear_channel(src, src_h, src_w, src_step, src_x, src_y,
                                    b_channel);
-  const float g = bilinear_channel(src, src_h, src_w, src_step, src_x, src_y,
+  const float g = (x >= content_w || y >= content_h) ? 255.0f : bilinear_channel(src, src_h, src_w, src_step, src_x, src_y,
                                    g_channel);
-  const float r = bilinear_channel(src, src_h, src_w, src_step, src_x, src_y,
+  const float r = (x >= content_w || y >= content_h) ? 255.0f : bilinear_channel(src, src_h, src_w, src_step, src_x, src_y,
                                    r_channel);
 
   constexpr float inv255 = 1.0f / 255.0f;
@@ -77,7 +77,15 @@ __global__ void resize_normalize_detector_kernel(
 void cuda_resize_normalize_detector(const GpuImage &src, float *dst_nchw,
                                     int dst_h, int dst_w, bool source_is_bgr,
                                     cudaStream_t stream) {
-  if (src.data == nullptr || src.rows <= 0 || src.cols <= 0 ||
+  cuda_resize_normalize_detector_padded(src, dst_nchw, dst_h, dst_w,
+                                         dst_h, dst_w, source_is_bgr, stream);
+}
+
+void cuda_resize_normalize_detector_padded(
+    const GpuImage &src, float *dst_nchw, int dst_h, int dst_w,
+    int content_h, int content_w, bool source_is_bgr, cudaStream_t stream) {
+  if (content_h <= 0 || content_w <= 0 || content_h > dst_h || content_w > dst_w ||
+      src.data == nullptr || src.rows <= 0 || src.cols <= 0 ||
       src.step < static_cast<std::size_t>(src.cols * 3) ||
       dst_nchw == nullptr || dst_h <= 0 || dst_w <= 0) {
     throw std::invalid_argument("invalid detector preprocess arguments");
@@ -87,7 +95,7 @@ void cuda_resize_normalize_detector(const GpuImage &src, float *dst_nchw,
                   (dst_h + block.y - 1) / block.y);
   resize_normalize_detector_kernel<<<grid, block, 0, stream>>>(
       static_cast<const unsigned char *>(src.data), src.rows, src.cols,
-      static_cast<int>(src.step), dst_nchw, dst_h, dst_w,
+      static_cast<int>(src.step), dst_nchw, dst_h, dst_w, content_h, content_w,
       source_is_bgr ? 1 : 0);
   PPOCRV6_CUDA_CHECK(cudaGetLastError());
 }

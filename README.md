@@ -5,19 +5,24 @@ native C++/CUDA/TensorRT runtime.
 
 ## Features
 
-- Rust HTTP server with health, glyph recognition, and full-page OCR endpoints.
+- Rust HTTP server with health, glyph, cropped-line, and full-page OCR endpoints.
 - Request limits, image limits, worker permits, and queue timeout controls at
   the API layer.
-- Coarse C ABI boundary: one native call per glyph batch or page request, with
+- Coarse C ABI boundary: one native call per glyph batch, line chunk, or page request, with
   no CUDA streams, TensorRT contexts, or device pointers exposed to Rust.
 - TensorRT DB detector and TensorRT hidden recognizer workers with long-lived
   engine/context state.
 - One shared recognizer engine/classifier allocation with independent execution
-  contexts for glyph traffic and full-page OCR.
+  contexts for glyph traffic and line recognition. Cropped-line and full-page
+  OCR share the same line worker/context and buffers.
 - Recognition profiles tuned for glyphs and OCR lines, with an optional
   short-line profile in newly built engines. The runtime filters line buckets
-  against the loaded engine and allocates context workspace lazily for the
-  smallest compatible profile.
+  against the loaded engine. Detector and recognition workers share a reserved
+  enqueue workspace with native synchronization through GPU completion.
+- `POST /v1/lines/recognize` accepts upright single-line crops, automatically
+  groups widths, and preserves input order. Enabled with `--enable-ocr` or
+  independently with `--enable-lines` (no detector required). See
+  [the line API contract](docs/api.md#cropped-line-recognition).
 - CUDA detector resize/color conversion/normalization.
 - CUDA ROI warp and recognition preprocessing for detected text boxes.
 - Custom CUDA classifier and native CTC decode. The recognizer is cut before
@@ -169,6 +174,10 @@ podman run --rm --device nvidia.com/gpu=all --network host --entrypoint bash \
 - [docs/build.md](docs/build.md) - build and run commands.
 - [docs/model-artifacts.md](docs/model-artifacts.md) - required model files.
 - [docs/architecture.md](docs/architecture.md) - runtime boundary and portability notes.
+- [Shared workspace validation](docs/shared-workspace-validation.md) - GPU memory reuse and regression checks.
+- [Line endpoint validation](docs/line-endpoint-validation.md) - cropped-line API coverage.
+- [Line profile tuning](docs/line-profile-tuning-results.md) - measured preprocessing and engine-profile tradeoffs.
+- [Detector padding validation](docs/detector-padding-validation.md) - small and extreme-aspect-ratio page handling.
 
 ## License
 

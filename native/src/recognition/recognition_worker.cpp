@@ -2,6 +2,7 @@
 
 #include "ppocrv6_native/common/cuda_check.h"
 #include "ppocrv6_native/common/cuda_ptr.h"
+#include "ppocrv6_native/common/trt_workspace.h"
 #include "ppocrv6_native/engine/trt_engine.h"
 #include "ppocrv6_native/kernels/classifier.h"
 #include "ppocrv6_native/recognition/glyph_shape.h"
@@ -429,6 +430,8 @@ public:
 
     PPOCRV6_CUDA_CHECK(cudaFree(nullptr));
     resources_ = acquire_shared_resources(config_);
+    workspace_ = acquire_trt_workspace(static_cast<std::size_t>(
+        std::max<int64_t>(0, resources_->engine->getDeviceMemorySizeV2())));
     context_.reset(resources_->engine->createExecutionContext(
         nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED));
     if (!context_) {
@@ -604,6 +607,8 @@ public:
     out << ",\"profiles\":" << resources_->engine->getNbOptimizationProfiles();
     out << ",\"shared_engine_use_count\":" << resources_.use_count();
     out << ",\"context_memory_bytes\":" << context_memory_capacity_bytes_;
+    out << ",\"workspace_shared\":" << (shared_trt_workspace_enabled() ? "true" : "false");
+    out << ",\"workspace_reserved_bytes\":" << workspace_->size();
     out << ",\"profile_memory_bytes\":[";
     for (int profile = 0;
          profile < resources_->engine->getNbOptimizationProfiles(); ++profile) {
@@ -637,6 +642,7 @@ public:
 
 private:
   void allocate_for_max_shape() {
+    TrtWorkspace::Lease lease(*workspace_, stream_);
     set_active_shape(config_.max_batch_size, config_.max_width, stream_, false);
     max_timesteps_ = output_dims_.d[1];
     max_rows_ = config_.max_batch_size * max_timesteps_;
@@ -647,7 +653,7 @@ private:
     const auto workspace = kernels::tiled_classifier_workspace_shape(
         max_rows_, config_.vocab_size, 16, config_.vocab_tile_size);
 
-    input_.reset(max_input_count_);
+
     hidden_.reset(max_hidden_count_);
     indices_.reset(static_cast<std::size_t>(max_rows_));
     prob_.reset(static_cast<std::size_t>(max_rows_));
@@ -665,6 +671,8 @@ private:
     if (config_.warmup_runs <= 0) {
       return;
     }
+    TrtWorkspace::Lease lease(*workspace_, stream_);
+    input_.reset(max_input_count_);
     const int warmup_batch =
         std::min(config_.default_batch_size, config_.max_batch_size);
     set_active_shape(warmup_batch, config_.default_width, stream_);
@@ -674,24 +682,17 @@ private:
     PPOCRV6_CUDA_CHECK(
         cudaMemsetAsync(input_.get(), 0, input_count * sizeof(float), stream_));
     for (int i = 0; i < config_.warmup_runs; ++i) {
-      launch_compute(input_.get(), stream_, CharacterPolicy::kAll, true);
+      launch_compute(input_.get(), stream_, CharacterPolicy::kAll, true, lease);
     }
     PPOCRV6_CUDA_CHECK(cudaStreamSynchronize(stream_));
   }
 
   void ensure_context_memory(int profile, cudaStream_t stream) {
-    const auto required = static_cast<std::size_t>(std::max<int64_t>(
+    (void)stream;
+    context_memory_capacity_bytes_ = static_cast<std::size_t>(std::max<int64_t>(
         0, resources_->engine->getDeviceMemorySizeForProfileV2(profile)));
-    if (required <= context_memory_capacity_bytes_) {
-      return;
-    }
-    if (context_memory_capacity_bytes_ > 0) {
-      PPOCRV6_CUDA_CHECK(cudaStreamSynchronize(stream));
-    }
-    context_memory_.reset(required);
-    context_memory_capacity_bytes_ = required;
-    context_->setDeviceMemoryV2(context_memory_.get(),
-                                static_cast<int64_t>(required));
+    // The caller holds a workspace lease. Bind in launch_compute after shape
+    // selection; another worker may have grown the arena since our last call.
   }
 
   void set_active_shape(int batch, int width, cudaStream_t stream,
@@ -765,7 +766,9 @@ private:
 
   void launch_compute(const float *device_input, cudaStream_t stream,
                       CharacterPolicy character_policy,
-                      bool calculate_probability) {
+                      bool calculate_probability, TrtWorkspace::Lease &lease) {
+    context_->setDeviceMemoryV2(lease.data(), static_cast<int64_t>(lease.size()));
+    // All callers hold a lease through stream completion.
     if (!context_->setTensorAddress(resources_->input_name.c_str(),
                                     const_cast<float *>(device_input)) ||
         !context_->setTensorAddress(resources_->output_name.c_str(),
@@ -782,6 +785,8 @@ private:
   void run_chunk(const float *chunk_input, int chunk_count, int width,
                  bool return_timesteps, CharacterPolicy character_policy,
                  ScoreMode score_mode, RecognitionBatchResult &result) {
+    TrtWorkspace::Lease lease(*workspace_, stream_);
+    if (!input_) input_.reset(max_input_count_);
     set_active_shape(chunk_count, width, stream_);
     const std::size_t input_count =
         static_cast<std::size_t>(chunk_count) * 3U * 48U *
@@ -791,7 +796,7 @@ private:
                                        cudaMemcpyHostToDevice, stream_));
     const bool calculate_probability = score_mode == ScoreMode::kModel;
     launch_compute(input_.get(), stream_, character_policy,
-                   calculate_probability);
+                   calculate_probability, lease);
 
     const std::size_t rows = static_cast<std::size_t>(active_rows_);
     PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(host_indices_.get(), indices_.get(),
@@ -819,10 +824,11 @@ private:
                         CharacterPolicy character_policy,
                         ScoreMode score_mode, RecognitionBatchResult &result,
                         cudaStream_t stream) {
+    TrtWorkspace::Lease lease(*workspace_, stream);
     set_active_shape(chunk_count, width, stream);
     const bool calculate_probability = score_mode == ScoreMode::kModel;
     launch_compute(device_chunk_input, stream, character_policy,
-                   calculate_probability);
+                   calculate_probability, lease);
 
     const std::size_t rows = static_cast<std::size_t>(active_rows_);
     PPOCRV6_CUDA_CHECK(cudaMemcpyAsync(host_indices_.get(), indices_.get(),
@@ -979,7 +985,7 @@ private:
 
   RecognitionWorkerConfig config_;
   std::shared_ptr<SharedResources> resources_;
-  CudaPtr<std::uint8_t> context_memory_;
+  std::shared_ptr<TrtWorkspace> workspace_;
   std::unique_ptr<nvinfer1::IExecutionContext> context_;
   CudaPtr<float> input_;
   CudaPtr<std::uint16_t> hidden_;

@@ -164,6 +164,11 @@ target_link_libraries(ppocrv6_ctc_smoke PRIVATE
   ppocrv6_native_core
 )
 
+find_package(Threads REQUIRED)
+add_executable(ppocrv6_trt_workspace_smoke src/tools/trt_workspace_smoke.cpp)
+target_link_libraries(ppocrv6_trt_workspace_smoke PRIVATE
+  ppocrv6_native_core CUDA::cudart Threads::Threads)
+
 add_executable(ppocrv6_glyph_shape_smoke
   src/tools/glyph_shape_smoke.cpp
 )
@@ -277,6 +282,9 @@ if(PPOCRV6_NATIVE_ENABLE_TENSORRT)
     target_link_libraries(ppocrv6_detection_worker_smoke PRIVATE
       ppocrv6_native_trt
     )
+
+    add_executable(ppocrv6_line_recognizer_smoke src/tools/line_recognizer_smoke.cpp)
+    target_link_libraries(ppocrv6_line_recognizer_smoke PRIVATE ppocrv6_native_trt)
 
     add_executable(ppocrv6_full_page_worker_smoke
       src/tools/full_page_worker_smoke.cpp
